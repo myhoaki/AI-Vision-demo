@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#101914">
+  <title>AI-VIsion-demo · Container detection</title>
+  <link rel="stylesheet" href="/static/style.css?v=2">
+</head>
+<body>
+  <header class="shell topbar">
+    <a class="brand" href="#detect" aria-label="AI Vision Demo home"><span class="brand-mark">AI</span><span><strong>AI-VIsion-demo</strong><small>Container intelligence workspace</small></span></a>
+    <div class="top-meta"><span class="live-dot"></span><span id="serviceStatus">Connecting to local server</span></div>
+  </header>
+  <main class="shell">
+    <section class="hero">
+      <div><p class="eyebrow">COMPUTER VISION · YOLO26</p><h1>See every container clearly.</h1><p class="hero-copy">Inspect the labeled dataset, train a container detector, then run it on your own images.</p></div>
+      <div class="hero-stat"><strong id="heroImageCount">—</strong><span>server images<br>available for training</span></div>
+    </section>
+    <nav class="tabs" aria-label="Workspace sections"><button class="tab active" data-view="detect">Detect</button><button class="tab" data-view="dataset">Dataset</button><button class="tab" data-view="train">Train model</button></nav>
+
+    <section id="view-detect" class="view active">
+      <div class="section-heading"><div><p class="eyebrow">CONTAINER DETECTOR</p><h2>Run an image</h2><p>Upload a photo or select one from the server dataset. Inference runs on the server CPU.</p></div><span class="pill" id="modelPill">Checking trained models</span></div>
+      <div class="detect-layout">
+        <div class="card input-card">
+          <label class="dropzone" id="dropzone" for="imageFile"><span class="upload-icon">↑</span><strong>Choose or drop an image</strong><span>JPG, PNG, WebP or TIFF · up to 20 MB</span><input id="imageFile" type="file" accept="image/jpeg,image/png,image/webp,image/bmp,image/tiff"></label>
+          <div class="control-row"><label>Detector<select id="modelSelect"><option value="">Latest trained model</option></select></label><label>Confidence <span id="confidenceLabel">0.25</span><input id="confidence" type="range" min="0.05" max="0.90" step="0.05" value="0.25"></label></div>
+          <button id="detectButton" class="button primary wide" disabled>Detect containers</button>
+          <p class="muted small" id="detectHint">Train a detector first. The pretrained COCO checkpoint does not include a container class.</p>
+        </div>
+        <div class="card result-card"><div class="card-title"><div><p class="eyebrow">PREDICTION</p><h3 id="resultTitle">Waiting for an image</h3></div><span id="resultCount" class="count-badge">—</span></div>
+          <div id="previewEmpty" class="preview-empty"><div class="empty-art">▧</div><p>Your image and container boxes will appear here.</p></div>
+          <div id="previewFrame" class="preview-frame" hidden><img id="previewImage" alt="Image being analyzed"><canvas id="overlay"></canvas></div>
+          <div id="resultMeta" class="result-meta muted">Bounding-box results stay in this session.</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-dataset" class="view" hidden>
+      <div class="section-heading"><div><p class="eyebrow">READ-ONLY SOURCE DATA</p><h2>Dataset explorer</h2><p>Browse training images and labels. Source files are mounted read-only and are never modified.</p></div><span class="pill green">Container · class 0</span></div>
+      <div class="dataset-summary" id="datasetSummary"></div>
+      <div id="datasetGrid" class="dataset-grid"></div>
+      <div class="center"><button id="loadMore" class="button secondary">Load more images</button></div>
+    </section>
+
+    <section id="view-train" class="view" hidden>
+      <div class="section-heading"><div><p class="eyebrow">CUSTOM MODEL TRAINING</p><h2>Train a container detector</h2><p>Starts from YOLO26n and learns the container boxes in the server dataset.</p></div><span class="pill amber">CPU training</span></div>
+      <div class="train-layout">
+        <form id="trainForm" class="card train-form">
+          <div class="form-head"><div class="step-number">01</div><div><h3>Training setup</h3><p>Training creates a separate run under this project.</p></div></div>
+          <label>Training mode<select id="initMode"><option value="base">New model · start from YOLO26 weights</option><option value="finetune">Fine-tune · start a new run from .pt weights</option><option value="resume">Resume · continue an interrupted run from last.pt</option></select></label>
+          <label id="baseModelRow">Base checkpoint<select id="baseModel"><option value="yolo26n.pt">YOLO26n · fastest, recommended</option><option value="yolo26s.pt">YOLO26s · balanced</option><option value="yolo26m.pt">YOLO26m · higher capacity</option></select></label>
+          <label id="checkpointRow" hidden>Saved checkpoint<select id="checkpointSelect"></select></label>
+          <div id="checkpointUploadRow" class="checkpoint-upload" hidden><label for="checkpointFile">Or upload a trusted YOLO .pt checkpoint <input id="checkpointFile" type="file" accept=".pt,application/octet-stream"></label><button id="uploadCheckpoint" type="button" class="button secondary">Upload checkpoint</button><small>Only upload .pt files from a trusted source. PyTorch checkpoint files can contain executable serialized code.</small></div>
+          <div class="form-grid"><label>Epochs<input id="epochs" type="number" min="1" max="300" value="50"></label><label>Image size<input id="imageSize" type="number" min="320" max="1280" step="32" value="640"></label><label>Batch size<input id="batch" type="number" min="1" max="32" value="4"></label></div>
+          <div class="notice"><strong>Training happens on the server.</strong><span>The first run downloads the selected starting weights. CPU training may take a long time. The dataset is split by source image so original and cropped derivatives stay together.</span></div>
+          <button id="startTraining" class="button primary wide">Start training</button>
+        </form>
+        <div class="card progress-card"><div class="form-head"><div class="step-number muted-step">02</div><div><h3>Training progress</h3><p>Close the browser whenever you need. Progress is saved on the server.</p></div></div>
+          <div id="trainingEmpty" class="training-empty"><div class="empty-art">⌁</div><p>No training run yet.</p></div>
+          <div id="trainingState" hidden><div class="progress-heading"><strong id="trainingStatus">Preparing</strong><span id="trainingEpoch">0 / 0 epochs</span></div><progress id="trainingProgress" max="1" value="0"></progress><p id="trainingMessage" class="muted"></p><div id="phaseProgress" class="phase-progress"></div><p class="test-note">Train and validation update every epoch. The held-out test set runs once after training finishes.</p><div id="splitCounts" class="split-counts"></div><div id="metricRows" class="metric-rows"></div></div>
+        </div>
+      </div>
+      <div class="card model-list-card"><div class="section-heading compact"><div><p class="eyebrow">MODEL CHECKPOINTS</p><h3>Saved .pt weights</h3></div><button id="refreshModels" class="button ghost">Refresh</button></div><div id="modelList" class="model-list"><p class="muted">No trained checkpoints yet.</p></div></div>
+      <div class="card model-list-card export-card"><div class="section-heading compact"><div><p class="eyebrow">DEPLOYMENT FORMAT</p><h3>Export ONNX</h3><p>Convert a saved PyTorch checkpoint into a validated ONNX file.</p></div></div>
+        <div class="export-form"><label>Checkpoint<select id="exportCheckpoint"></select></label><label>Image size<select id="exportImageSize"><option>640</option><option>512</option><option>416</option><option>320</option><option>960</option></select></label><label>Opset<select id="exportOpset"><option>17</option><option>18</option><option>12</option><option>13</option><option>14</option><option>15</option><option>16</option><option>19</option><option>20</option><option>21</option><option>22</option><option>23</option></select></label><label class="check-option"><input id="exportDynamic" type="checkbox"> Dynamic image sizes</label><button id="startExport" class="button primary">Export ONNX</button></div>
+        <div id="exportStatus" class="export-status muted">ONNX exports are saved in this project and can be downloaded here.</div>
+      </div>
+    </section>
+    <footer><span>AI-VIsion-demo</span><span>Read-only dataset · isolated training runs</span></footer>
+  </main>
+  <div id="toast" role="status" class="toast" hidden></div>
+  <script src="/static/app.js?v=2"></script>
+</body>
+</html>

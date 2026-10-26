@@ -1,0 +1,4 @@
+runs/**
+.git
+__pycache__
+*.pyc
