@@ -80,12 +80,114 @@ def checkpoint_models() -> list[dict[str, Any]]:
     for metadata in jobs_dir.glob("*/job.json"):
         try:
             job = json.loads(metadata.read_text(encoding="utf-8"))
-            best = metadata.parent / "results" / "container" / "weights" / "best.pt"
+            if job.get("resumedBy"):
+                continue
+            best = checkpoint_weight_dir(metadata, job) / "best.pt"
             if best.is_file() and job.get("status") == "completed":
                 models.append({"id": job["id"], "name": f"Container {Path(job.get('baseModel', 'yolo26n.pt')).stem.upper()} · {job['id'][:8]}", "path": str(best), "createdAt": job.get("updatedAt"), "epochs": job.get("epochs"), "metrics": job.get("metrics", {})})
         except (OSError, ValueError, KeyError):
             continue
     return sorted(models, key=lambda model: model.get("createdAt") or "", reverse=True)
+
+
+ACTIVE_TRAINING_STATUSES = {"queued", "preparing", "running", "evaluating"}
+FINAL_TRAINING_STATUSES = {"completed", "failed", "cancelled", "canceled", "interrupted"}
+
+
+def checkpoint_weight_dir(metadata: Path, job: dict[str, Any]) -> Path:
+    configured = job.get("checkpointOutputDir")
+    if configured:
+        candidate = Path(configured)
+        candidate = candidate if candidate.is_absolute() else RUNS_DIR / candidate
+        candidate = candidate.resolve()
+        if candidate.is_relative_to(RUNS_DIR):
+            return candidate
+
+    if job.get("initMode") == "resume":
+        source_id = re.fullmatch(r"([a-f0-9]{32})-last", str(job.get("checkpointId", "")))
+        if source_id:
+            source_job = RUNS_DIR / "jobs" / source_id.group(1)
+            return source_job / "results" / "container" / "weights"
+
+    return metadata.parent / "results" / "container" / "weights"
+
+
+def checkpoint_timestamp(path: Path) -> str | None:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+    except OSError:
+        return None
+
+
+def training_runs() -> list[dict[str, Any]]:
+    runs: list[dict[str, Any]] = []
+    jobs_dir = RUNS_DIR / "jobs"
+    if not jobs_dir.is_dir():
+        return runs
+
+    ready_model_ids = {model["id"] for model in checkpoint_models()}
+    for metadata in jobs_dir.glob("*/job.json"):
+        try:
+            job = json.loads(metadata.read_text(encoding="utf-8"))
+            job_id = str(job["id"])
+            status = str(job.get("status", "unknown")).lower()
+            status_label = (
+                "TRAINING" if status in ACTIVE_TRAINING_STATUSES else
+                "COMPLETED" if status == "completed" else
+                "CANCELLED" if status in {"cancelled", "canceled", "interrupted"} else
+                "FAILED" if status == "failed" else
+                "FAILED"
+            )
+            weight_dir = checkpoint_weight_dir(metadata, job)
+            checkpoints = []
+            for kind in (() if job.get("resumedBy") else ("best", "last")):
+                path = weight_dir / f"{kind}.pt"
+                if not path.is_file():
+                    continue
+                ready = kind == "best" and status == "completed" and job_id in ready_model_ids
+                checkpoints.append({
+                    "id": f"{job_id}-{kind}",
+                    "kind": kind,
+                    "filename": path.name,
+                    "sizeBytes": path.stat().st_size,
+                    "lastModifiedAt": checkpoint_timestamp(path),
+                    "downloadUrl": f"/api/checkpoints/{job_id}-{kind}/download",
+                    "downloadAllowed": status in FINAL_TRAINING_STATUSES,
+                    "interim": status in ACTIVE_TRAINING_STATUSES,
+                    "readyForDetection": ready,
+                    "description": "Highest validation score so far; used for detection when the run passes readiness checks." if kind == "best" else "Most recent training state; useful for continuing an interrupted run.",
+                })
+            last_checkpoint_update = max((item["lastModifiedAt"] for item in checkpoints if item["lastModifiedAt"]), default=None)
+            created_at = job.get("createdAt")
+            display_time = job.get("startedAt") or created_at
+            model_name = Path(str(job.get("baseModel", "yolo26n.pt"))).stem
+            model_label = f"YOLO{model_name[4:]}" if model_name.lower().startswith("yolo") else model_name
+            try:
+                parsed_time = datetime.fromisoformat(str(display_time).replace("Z", "+00:00")) if display_time else None
+                readable_time = parsed_time.astimezone().strftime("%b %d, %Y, %H:%M") if parsed_time else None
+            except (ValueError, TypeError):
+                readable_time = None
+            runs.append({
+                "id": job_id,
+                "shortId": job_id[:8],
+                "name": f"{model_label} Training — {readable_time}" if readable_time else f"{model_label} Training run",
+                "baseModel": model_label,
+                "status": status,
+                "statusLabel": status_label,
+                "message": job.get("message"),
+                "createdAt": created_at,
+                "startedAt": job.get("startedAt"),
+                "completedAt": job.get("completedAt") or (job.get("updatedAt") if status == "completed" else None),
+                "finishedAt": job.get("finishedAt") or (job.get("updatedAt") if status in {"completed", "failed", "cancelled", "canceled", "interrupted"} else None),
+                "updatedAt": job.get("updatedAt"),
+                "epoch": job.get("epoch"),
+                "totalEpochs": job.get("totalEpochs") or job.get("epochs"),
+                "lastCheckpointUpdatedAt": last_checkpoint_update,
+                "checkpoints": checkpoints,
+            })
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return sorted(runs, key=lambda run: run.get("startedAt") or run.get("createdAt") or "", reverse=True)
 
 
 def list_checkpoints() -> list[dict[str, Any]]:
@@ -96,7 +198,9 @@ def list_checkpoints() -> list[dict[str, Any]]:
             try:
                 job = json.loads(metadata.read_text(encoding="utf-8"))
                 job_id = str(job["id"])
-                weight_dir = metadata.parent / "results" / "container" / "weights"
+                if job.get("resumedBy"):
+                    continue
+                weight_dir = checkpoint_weight_dir(metadata, job)
                 for kind in ("best", "last"):
                     path = weight_dir / f"{kind}.pt"
                     if not path.is_file():
@@ -108,9 +212,13 @@ def list_checkpoints() -> list[dict[str, Any]]:
                         "kind": kind,
                         "source": "training run",
                         "jobStatus": job.get("status"),
-                        "fineTuneAllowed": True,
+                        "fineTuneAllowed": job.get("status") in FINAL_TRAINING_STATUSES,
                         "resumeAllowed": kind == "last" and job.get("status") in {"failed", "interrupted"},
                         "createdAt": job.get("updatedAt"),
+                        "sizeBytes": path.stat().st_size,
+                        "lastModifiedAt": checkpoint_timestamp(path),
+                        "downloadAllowed": job.get("status") in FINAL_TRAINING_STATUSES,
+                        "interim": job.get("status") in ACTIVE_TRAINING_STATUSES,
                         "downloadUrl": f"/api/checkpoints/{job_id}-{kind}/download",
                     })
             except (OSError, ValueError, KeyError):
@@ -131,6 +239,10 @@ def list_checkpoints() -> list[dict[str, Any]]:
                         "fineTuneAllowed": True,
                         "resumeAllowed": False,
                         "createdAt": saved.get("createdAt"),
+                        "sizeBytes": path.stat().st_size,
+                        "lastModifiedAt": checkpoint_timestamp(path),
+                        "downloadAllowed": True,
+                        "interim": False,
                         "downloadUrl": f"/api/checkpoints/{metadata.stem}/download",
                     })
             except (OSError, ValueError):
@@ -153,10 +265,20 @@ def resolve_checkpoint(checkpoint_id: str) -> tuple[Path, dict[str, Any]]:
         raise HTTPException(400, "Invalid checkpoint id")
     job_id, kind = match.groups()
     job = read_job(job_id)
-    path = RUNS_DIR / "jobs" / job_id / "results" / "container" / "weights" / f"{kind}.pt"
+    successor_id = job.get("resumedBy")
+    if successor_id:
+        try:
+            successor = read_job(str(successor_id))
+        except HTTPException:
+            successor = {}
+        if successor.get("status") in ACTIVE_TRAINING_STATUSES:
+            raise HTTPException(409, "This checkpoint is being updated by a resumed training run. Use its current run checkpoint after training stops.")
+    if job.get("status") not in FINAL_TRAINING_STATUSES:
+        raise HTTPException(409, "This checkpoint is not finalized yet and may still be changing. Download it after the training run stops.")
+    path = checkpoint_weight_dir(job_path(job_id), job) / f"{kind}.pt"
     if not path.is_file():
         raise HTTPException(404, "Training checkpoint not found")
-    descriptor = {"id": checkpoint_id, "kind": kind, "jobStatus": job.get("status"), "resumeAllowed": kind == "last" and job.get("status") in {"failed", "interrupted"}}
+    descriptor = {"id": checkpoint_id, "jobId": job_id, "kind": kind, "jobStatus": job.get("status"), "resumeAllowed": kind == "last" and job.get("status") in {"failed", "interrupted"} and not job.get("resumedBy")}
     return path, descriptor
 
 
@@ -230,6 +352,10 @@ def validate_label(path: Path) -> int:
     return count
 
 
+def advance_batch_count(current: int, total: int) -> int:
+    return min(max(0, current) + 1, max(0, total))
+
+
 def build_training_dataset(job_id: str) -> tuple[Path, dict[str, int], str, int]:
     image_root, labels_root = DATASET_ROOT / "images", DATASET_ROOT / "labels"
     if not image_root.is_dir() or not labels_root.is_dir():
@@ -297,7 +423,7 @@ def train_worker(job_id: str, request: TrainRequest) -> None:
     global _active_training
     job = read_job(job_id)
     try:
-        job.update(status="preparing", updatedAt=utc_now(), message="Validating labels and creating leakage-aware dataset splits.")
+        job.update(status="preparing", startedAt=job.get("startedAt") or utc_now(), updatedAt=utc_now(), message="Validating labels and creating leakage-aware dataset splits.")
         save_job(job)
         yaml_path, split_counts, fingerprint, skipped_images = build_training_dataset(job_id)
         job.update(status="running", updatedAt=utc_now(), message=f"Training on CPU. {skipped_images} images with missing or invalid labels were excluded. The first run downloads YOLO26n weights.", splitCounts=split_counts, skippedImages=skipped_images, datasetFingerprint=fingerprint)
@@ -311,6 +437,9 @@ def train_worker(job_id: str, request: TrainRequest) -> None:
             checkpoint_path, checkpoint = resolve_checkpoint(request.checkpointId)
             if request.initMode == "resume" and not checkpoint.get("resumeAllowed"):
                 raise ValueError("Resume is available only for a saved last.pt checkpoint from an interrupted or failed training run. Choose Fine-tune to start a new run from other .pt files.")
+            if request.initMode == "resume":
+                job["checkpointOutputDir"] = str(checkpoint_path.parent)
+                job["resumedFromJobId"] = checkpoint.get("jobId")
         initial_model = str(checkpoint_path) if checkpoint_path else request.baseModel
         model = YOLO(initial_model)
         job_dir = RUNS_DIR / "jobs" / job_id
@@ -325,6 +454,7 @@ def train_worker(job_id: str, request: TrainRequest) -> None:
         save_job(job)
 
         last_progress_save = 0.0
+        train_batches_seen = 0
 
         def update_phase(phase: str, current: int, total: int, epoch: int | None = None, force: bool = False) -> None:
             nonlocal last_progress_save
@@ -345,6 +475,8 @@ def train_worker(job_id: str, request: TrainRequest) -> None:
                 last_progress_save = now
 
         def on_train_epoch_start(trainer: Any) -> None:
+            nonlocal train_batches_seen
+            train_batches_seen = 0
             epoch = int(getattr(trainer, "epoch", 0)) + 1
             job.update(epoch=epoch, currentStage="train")
             phases = job.setdefault("phaseProgress", {})
@@ -354,8 +486,10 @@ def train_worker(job_id: str, request: TrainRequest) -> None:
             update_phase("train", 0, len(getattr(trainer, "train_loader", [])), epoch, force=True)
 
         def on_train_batch_end(trainer: Any) -> None:
+            nonlocal train_batches_seen
             total = len(getattr(trainer, "train_loader", []))
-            update_phase("train", int(getattr(trainer, "batch_i", -1)) + 1, total, int(getattr(trainer, "epoch", 0)) + 1)
+            train_batches_seen = advance_batch_count(train_batches_seen, total)
+            update_phase("train", train_batches_seen, total, int(getattr(trainer, "epoch", 0)) + 1)
 
         def on_train_epoch_end(trainer: Any) -> None:
             total = len(getattr(trainer, "train_loader", []))
@@ -388,7 +522,8 @@ def train_worker(job_id: str, request: TrainRequest) -> None:
         model.add_callback("on_val_end", on_val_end)
         model.add_callback("on_fit_epoch_end", on_epoch_end)
         model.train(data=str(yaml_path), epochs=request.epochs, imgsz=request.imageSize, batch=request.batch, device="cpu", workers=0, cache=False, amp=False, project=str(job_dir / "results"), name="container", exist_ok=True, plots=True, save=True, patience=20, resume=request.initMode == "resume")
-        best = job_dir / "results" / "container" / "weights" / "best.pt"
+        weight_dir = Path(job.get("checkpointOutputDir")) if job.get("checkpointOutputDir") else job_dir / "results" / "container" / "weights"
+        best = weight_dir / "best.pt"
         if not best.is_file():
             raise RuntimeError("Training ended without producing weights/best.pt")
         job.update(status="evaluating", evaluatingTest=True, updatedAt=utc_now(), message="Training finished. Evaluating the held-out test split once.", checkpoint=str(best))
@@ -399,10 +534,12 @@ def train_worker(job_id: str, request: TrainRequest) -> None:
         test_model.add_callback("on_val_end", on_val_end)
         test_result = test_model.val(data=str(yaml_path), split="test", imgsz=request.imageSize, batch=request.batch, device="cpu", workers=0, plots=True, verbose=False)
         test_metrics = {str(key): float(value) for key, value in getattr(test_result, "results_dict", {}).items() if isinstance(value, (int, float))}
-        job.update(status="completed", evaluatingTest=False, currentStage="complete", updatedAt=utc_now(), message="Training and final test evaluation completed. The best checkpoint is ready for detection.", checkpoint=str(best), epoch=request.epochs, testMetrics=test_metrics)
+        completed_at = utc_now()
+        job.update(status="completed", evaluatingTest=False, currentStage="complete", updatedAt=completed_at, completedAt=completed_at, finishedAt=completed_at, message="Training and final test evaluation completed. The best checkpoint is ready for detection.", checkpoint=str(best), epoch=request.epochs, testMetrics=test_metrics)
         save_job(job)
     except Exception as error:
-        job.update(status="failed", updatedAt=utc_now(), message=str(error)[:1200])
+        finished_at = utc_now()
+        job.update(status="failed", updatedAt=finished_at, finishedAt=finished_at, message=str(error)[:1200])
         save_job(job)
     finally:
         with _lock:
@@ -435,7 +572,7 @@ def dataset_file(path: str):
 
 @app.get("/api/models")
 def models():
-    return {"models": checkpoint_models(), "checkpoints": list_checkpoints()}
+    return {"models": checkpoint_models(), "checkpoints": list_checkpoints(), "trainingRuns": training_runs()}
 
 
 @app.post("/api/checkpoints/upload")
@@ -643,7 +780,8 @@ def recover_jobs():
         try:
             job = json.loads(metadata.read_text(encoding="utf-8"))
             if job.get("status") in {"queued", "preparing", "running", "evaluating"}:
-                job.update(status="interrupted", updatedAt=utc_now(), message="Server restarted during training. A saved last checkpoint may be available for a future resume feature.")
+                interrupted_at = utc_now()
+                job.update(status="interrupted", updatedAt=interrupted_at, finishedAt=interrupted_at, message="Server restarted during training. A saved last checkpoint may be available for a future resume feature.")
                 save_job(job)
         except (OSError, ValueError):
             continue
