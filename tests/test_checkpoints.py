@@ -1,4 +1,5 @@
 import json
+import csv
 import tempfile
 import unittest
 from pathlib import Path
@@ -128,6 +129,101 @@ class CheckpointRunTests(unittest.TestCase):
         self.assertEqual(len(runs[resumed_id]["checkpoints"]), 2)
         self.assertTrue(all(item["interim"] for item in runs[resumed_id]["checkpoints"]))
         self.assertEqual(len([item for item in main.list_checkpoints() if item["source"] == "training run"]), 2)
+
+    def test_epoch_metrics_csv_parse_and_merge_deduplicates_resume_history(self):
+        run_id = "2" * 32
+        run_dir = main.RUNS_DIR / "jobs" / run_id
+        results_dir = run_dir / "results" / "container"
+        results_dir.mkdir(parents=True)
+        csv_path = results_dir / "results.csv"
+        with csv_path.open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=["epoch", "time", "train/box_loss", "metrics/mAP50(B)"])
+            writer.writeheader()
+            writer.writerows([
+                {"epoch": 1, "time": 8.5, "train/box_loss": 1.2, "metrics/mAP50(B)": 0.4},
+                {"epoch": 2, "time": 18.0, "train/box_loss": 0.9, "metrics/mAP50(B)": 0.6},
+            ])
+        parsed = main.csv_epoch_metrics(csv_path)
+        self.assertEqual(parsed[1]["epochDurationSeconds"], 9.5)
+        job = {"parentRunId": "p" * 32, "resumeParentEpoch": 1, "epochMetrics": [parsed[0]]}
+        merged = main.merge_epoch_metrics(job, parsed, "2026-10-27T00:00:00+00:00")
+        self.assertEqual([point["epoch"] for point in merged], [1, 2])
+        self.assertTrue(merged[0]["inherited"])
+        self.assertFalse(merged[1].get("inherited", False))
+        self.assertEqual(merged[1]["metrics"]["metrics/mAP50(B)"], 0.6)
+
+    def test_metrics_endpoint_reads_real_csv_and_returns_one_point_per_epoch(self):
+        job_id = "3" * 32
+        run_dir = main.RUNS_DIR / "jobs" / job_id
+        results_dir = run_dir / "results" / "container"
+        results_dir.mkdir(parents=True)
+        (run_dir / "job.json").write_text(json.dumps({"id": job_id, "status": "completed"}))
+        (results_dir / "results.csv").write_text("epoch,time,metrics/mAP50(B)\n1,10,0.2\n2,20,0.3\n")
+        response = main.training_metrics(job_id)
+        self.assertEqual(response["source"], "Ultralytics results.csv")
+        self.assertEqual(len(response["metrics"]), 2)
+        self.assertEqual(response["metrics"][1]["metrics"]["metrics/mAP50(B)"], 0.3)
+
+    def test_resources_and_event_helpers_keep_json_safe_bounded_history(self):
+        job = {"events": [{"message": "old"}] * 201}
+        main.append_job_event(job, "warning", "latest", "test")
+        self.assertEqual(len(job["events"]), 200)
+        self.assertEqual(job["events"][-1]["message"], "latest")
+        self.assertIsNone(main.json_safe(float("nan")))
+
+    def test_stale_warning_only_applies_to_old_active_job_updates(self):
+        stale = {"status": "running", "updatedAt": "2020-01-01T00:00:00+00:00"}
+        fresh = {"status": "running", "updatedAt": main.utc_now()}
+        terminal = {"status": "failed", "updatedAt": "2020-01-01T00:00:00+00:00"}
+        self.assertTrue(main.is_stale_job(stale))
+        self.assertFalse(main.is_stale_job(fresh))
+        self.assertFalse(main.is_stale_job(terminal))
+
+    def test_csv_backfill_updates_terminal_jobs_but_never_active_jobs(self):
+        for job_id, status in (("4" * 32, "completed"), ("5" * 32, "running")):
+            run_dir = main.RUNS_DIR / "jobs" / job_id
+            results_dir = run_dir / "results" / "container"
+            results_dir.mkdir(parents=True)
+            job = {"id": job_id, "status": status, "epochMetrics": []}
+            (run_dir / "job.json").write_text(json.dumps(job))
+            (results_dir / "results.csv").write_text("epoch,time,metrics/mAP50(B)\n1,10,0.2\n")
+        main.backfill_job_metrics()
+        terminal = json.loads((main.RUNS_DIR / "jobs" / ("4" * 32) / "job.json").read_text())
+        active = json.loads((main.RUNS_DIR / "jobs" / ("5" * 32) / "job.json").read_text())
+        self.assertEqual(len(terminal["epochMetrics"]), 1)
+        self.assertEqual(active["epochMetrics"], [])
+
+    def test_resume_metrics_mark_parent_epochs_using_parent_job_record(self):
+        parent_id, child_id = "6" * 32, "7" * 32
+        parent_dir = main.RUNS_DIR / "jobs" / parent_id
+        parent_results = parent_dir / "results" / "container"
+        parent_results.mkdir(parents=True)
+        (parent_dir / "job.json").write_text(json.dumps({"id": parent_id, "status": "interrupted", "epoch": 1}))
+        (parent_results / "results.csv").write_text("epoch,time,metrics/mAP50(B)\n1,10,0.2\n2,20,0.3\n")
+        child_dir = main.RUNS_DIR / "jobs" / child_id
+        (child_dir / "results" / "container").mkdir(parents=True)
+        (child_dir / "job.json").write_text(json.dumps({"id": child_id, "status": "running", "initMode": "resume", "checkpointId": f"{parent_id}-last", "epoch": 2}))
+        history = main.training_metrics(child_id)
+        self.assertEqual([point.get("inherited", False) for point in history["metrics"]], [True, False])
+        self.assertEqual(history["metrics"][0]["inheritedFromRunId"], parent_id)
+
+    def test_epoch_timing_uses_real_durations_and_remaining_epochs(self):
+        job = {"epoch": 3}
+        main.update_epoch_timing(job, [{"epochDurationSeconds": 100}, {"epochDurationSeconds": 120}], 8)
+        self.assertEqual(job["averageEpochDurationSeconds"], 110)
+        self.assertEqual(job["estimatedRemainingSeconds"], 550)
+        self.assertEqual(job["recentTrainingSpeed"]["imagesPerSecond"], None)
+
+    def test_observability_instance_refuses_mutating_training_actions(self):
+        previous = main.OBSERVABILITY_ONLY
+        main.OBSERVABILITY_ONLY = True
+        try:
+            self.assertTrue(main.health()["readOnly"])
+            with self.assertRaises(HTTPException) as error:
+                main.start_training(main.TrainRequest(epochs=1, imageSize=640, batch=1, baseModel="yolo26n.pt", initMode="base"))
+            self.assertEqual(error.exception.status_code, 403)
+        finally:
+            main.OBSERVABILITY_ONLY = previous
 
 
 if __name__ == "__main__":

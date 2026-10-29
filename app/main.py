@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import csv
 import json
+import math
 import os
+import platform
 import random
 import re
+import resource as resource_usage
 import shutil
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +34,7 @@ _model_lock = threading.Lock()
 _loaded_model: tuple[str, Any] | None = None
 _export_lock = threading.Lock()
 _active_export: str | None = None
+OBSERVABILITY_ONLY = os.getenv("OBSERVABILITY_ONLY", "0").lower() in {"1", "true", "yes"}
 app = FastAPI(title="AI Vision Demo", version="1.0.0")
 
 
@@ -68,8 +74,168 @@ def save_job(job: dict[str, Any]) -> None:
     path = job_path(job["id"])
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(job, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    with _lock:
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(job, stream, indent=2, ensure_ascii=False, allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+
+
+def csv_epoch_metrics(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    points: list[dict[str, Any]] = []
+    previous_elapsed = 0.0
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as stream:
+            for row in csv.DictReader(stream):
+                values: dict[str, float] = {}
+                for key, raw in row.items():
+                    if key is None or raw is None:
+                        continue
+                    try:
+                        value = float(raw.strip())
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(value):
+                        values[key.strip()] = value
+                epoch_value = values.get("epoch")
+                if epoch_value is None:
+                    continue
+                epoch = int(epoch_value)
+                elapsed = values.get("time")
+                point: dict[str, Any] = {"epoch": epoch, "metrics": {k: v for k, v in values.items() if k not in {"epoch", "time"}}}
+                if elapsed is not None:
+                    point["elapsedTrainingSeconds"] = elapsed
+                    point["epochDurationSeconds"] = max(0.0, elapsed - previous_elapsed)
+                    previous_elapsed = elapsed
+                points.append(point)
+    except (OSError, csv.Error, UnicodeError):
+        return []
+    return points
+
+
+def merge_epoch_metrics(job: dict[str, Any], rows: list[dict[str, Any]], recorded_at: str | None = None) -> list[dict[str, Any]]:
+    existing = {int(point["epoch"]): point for point in job.get("epochMetrics", []) if isinstance(point, dict) and str(point.get("epoch", "")).isdigit()}
+    inherited_through = int(job.get("resumeParentEpoch") or 0)
+    inherited_from = job.get("parentRunId")
+    for row in rows:
+        epoch = int(row["epoch"])
+        old = existing.get(epoch, {})
+        point = {**old, **row}
+        point.setdefault("recordedAt", recorded_at or utc_now())
+        if inherited_from and epoch <= inherited_through:
+            point["inherited"] = True
+            point["inheritedFromRunId"] = inherited_from
+        existing[epoch] = point
+    return [existing[epoch] for epoch in sorted(existing)]
+
+
+def append_job_event(job: dict[str, Any], level: str, message: str, source: str = "app") -> None:
+    events = job.setdefault("events", [])
+    events.append({"timestamp": utc_now(), "level": level.upper(), "source": source, "message": str(message)[:2000]})
+    job["events"] = events[-200:]
+
+
+def json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [json_safe(item) for item in value]
+    return str(value)
+
+
+def resource_sample(previous: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    try:
+        cpu = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()
+        current = {"total": sum(map(int, cpu[1:])), "idle": int(cpu[4]) + (int(cpu[5]) if len(cpu) > 5 else 0)}
+        cpu_percent = None
+        if previous and current["total"] > previous["total"]:
+            total_delta = current["total"] - previous["total"]
+            idle_delta = current["idle"] - previous["idle"]
+            cpu_percent = round(max(0.0, min(100.0, 100 * (1 - idle_delta / total_delta))), 1)
+        memory = {}
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition(":")
+            if key in {"MemTotal", "MemAvailable"}:
+                memory[key] = int(value.strip().split()[0]) * 1024
+        total_memory = memory.get("MemTotal")
+        memory_used = total_memory - memory["MemAvailable"] if total_memory and "MemAvailable" in memory else None
+        try:
+            cgroup_used = int(Path("/sys/fs/cgroup/memory.current").read_text().strip())
+            cgroup_limit_raw = Path("/sys/fs/cgroup/memory.max").read_text().strip()
+            cgroup_limit = int(cgroup_limit_raw) if cgroup_limit_raw != "max" else None
+            if cgroup_limit:
+                memory_used, total_memory = cgroup_used, cgroup_limit
+        except (OSError, ValueError):
+            pass
+        process_cpu = resource_usage.getrusage(resource_usage.RUSAGE_SELF)
+        cpu_seconds = process_cpu.ru_utime + process_cpu.ru_stime
+        sampled_monotonic = time.monotonic()
+        process_cpu_percent = None
+        if previous and sampled_monotonic > previous.get("sampledMonotonic", sampled_monotonic):
+            process_cpu_percent = round(max(0.0, (cpu_seconds - previous.get("processCpuSeconds", cpu_seconds)) / (sampled_monotonic - previous["sampledMonotonic"]) * 100), 1)
+        current.update(processCpuSeconds=cpu_seconds, sampledMonotonic=sampled_monotonic)
+        return {"cpuPercent": cpu_percent, "processCpuPercent": process_cpu_percent, "memoryTotalBytes": total_memory, "memoryAvailableBytes": memory.get("MemAvailable"), "memoryUsedBytes": memory_used, "memoryScope": "container cgroup limit/current" if Path("/sys/fs/cgroup/memory.current").is_file() else "host-visible /proc/meminfo"}, current
+    except (OSError, IndexError, ValueError):
+        return {}, previous
+
+
+def results_csv_path(metadata: Path, job: dict[str, Any]) -> Path:
+    return checkpoint_weight_dir(metadata, job).parent / "results.csv"
+
+
+def metric_history(job_id: str) -> dict[str, Any]:
+    metadata = job_path(job_id)
+    if not metadata.is_file():
+        raise HTTPException(404, "Training job not found")
+    job = json.loads(metadata.read_text(encoding="utf-8"))
+    history_job = dict(job)
+    if not history_job.get("parentRunId") and history_job.get("initMode") == "resume":
+        match = re.fullmatch(r"([a-f0-9]{32})-last", str(history_job.get("checkpointId", "")))
+        if match:
+            parent_id = match.group(1)
+            parent_meta = RUNS_DIR / "jobs" / parent_id / "job.json"
+            if parent_meta.is_file():
+                parent_job = json.loads(parent_meta.read_text(encoding="utf-8"))
+                parent_rows = csv_epoch_metrics(results_csv_path(parent_meta, parent_job))
+                history_job["parentRunId"] = parent_id
+                history_job["resumeParentEpoch"] = int(parent_job.get("epoch") or max((int(row["epoch"]) for row in parent_rows), default=0))
+    points = merge_epoch_metrics(history_job, csv_epoch_metrics(results_csv_path(metadata, job)))
+    if not points:
+        points = job.get("epochMetrics", [])
+    return {"runId": job_id, "metrics": points, "recordedAt": job.get("metricsUpdatedAt"), "source": "Ultralytics results.csv" if results_csv_path(metadata, job).is_file() else "job record"}
+
+
+def backfill_job_metrics() -> None:
+    jobs_dir = RUNS_DIR / "jobs"
+    if not jobs_dir.is_dir():
+        return
+    for metadata in jobs_dir.glob("*/job.json"):
+        try:
+            job = json.loads(metadata.read_text(encoding="utf-8"))
+            rows = csv_epoch_metrics(results_csv_path(metadata, job))
+            if job.get("status") not in ACTIVE_TRAINING_STATUSES and rows and len(job.get("epochMetrics", [])) < len(rows):
+                job["epochMetrics"] = merge_epoch_metrics(job, rows)
+                job["metricsUpdatedAt"] = utc_now()
+                save_job(job)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
 
 
 def checkpoint_models() -> list[dict[str, Any]]:
@@ -119,6 +285,70 @@ def checkpoint_timestamp(path: Path) -> str | None:
         return None
 
 
+def is_stale_job(job: dict[str, Any], status: str | None = None) -> bool:
+    if (status or str(job.get("status", ""))).lower() not in ACTIVE_TRAINING_STATUSES or not job.get("updatedAt"):
+        return False
+    try:
+        updated = datetime.fromisoformat(str(job["updatedAt"]).replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - updated.astimezone(timezone.utc)).total_seconds() > 120
+    except (ValueError, TypeError):
+        return False
+
+
+def recorded_training_config(metadata: Path, job: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(job.get("config"), dict) and job["config"]:
+        return job["config"]
+    args_path = results_csv_path(metadata, job).parent / "args.yaml"
+    if args_path.is_file():
+        try:
+            import yaml
+            value = yaml.safe_load(args_path.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                value["source"] = "Ultralytics args.yaml"
+                return json_safe(value)
+        except (OSError, ValueError, ImportError):
+            pass
+    keys = ("initMode", "initialModel", "baseModel", "epochs", "totalEpochs", "imageSize", "batch", "datasetFingerprint")
+    return {key: job[key] for key in keys if job.get(key) is not None}
+
+
+def inherited_checkpoint_metadata(metadata: Path, job: dict[str, Any]) -> dict[str, Any]:
+    recorded = job.get("inheritedCheckpoint")
+    if isinstance(recorded, dict) and recorded:
+        return recorded
+    if job.get("initMode") != "resume" or not job.get("startedAt"):
+        return {}
+    weight = checkpoint_weight_dir(metadata, job) / "last.pt"
+    try:
+        modified = datetime.fromtimestamp(weight.stat().st_mtime, timezone.utc)
+        started = datetime.fromisoformat(str(job["startedAt"]).replace("Z", "+00:00"))
+        if modified <= started:
+            match = re.fullmatch(r"([a-f0-9]{32})-last", str(job.get("checkpointId", "")))
+            return {"runId": match.group(1) if match else job.get("resumedFromJobId"), "path": str(weight), "sizeBytes": weight.stat().st_size, "modifiedAt": modified.isoformat(), "source": "inferred from checkpoint file mtime before resume start"}
+    except (OSError, ValueError, TypeError):
+        return {}
+    return {}
+
+
+def resumed_parent(metadata: Path, job: dict[str, Any]) -> tuple[str | None, int | None]:
+    parent_id = job.get("parentRunId") or job.get("resumedFromJobId")
+    if not parent_id:
+        match = re.fullmatch(r"([a-f0-9]{32})-last", str(job.get("checkpointId", "")))
+        parent_id = match.group(1) if match else None
+    if not parent_id:
+        return None, None
+    parent_path = RUNS_DIR / "jobs" / str(parent_id) / "job.json"
+    try:
+        parent_job = json.loads(parent_path.read_text(encoding="utf-8"))
+        epoch = parent_job.get("epoch")
+        if isinstance(epoch, int):
+            return str(parent_id), epoch
+        rows = csv_epoch_metrics(results_csv_path(parent_path, parent_job))
+        return str(parent_id), max((int(row["epoch"]) for row in rows), default=0)
+    except (OSError, ValueError, KeyError, TypeError):
+        return str(parent_id), None
+
+
 def training_runs() -> list[dict[str, Any]]:
     runs: list[dict[str, Any]] = []
     jobs_dir = RUNS_DIR / "jobs"
@@ -147,10 +377,15 @@ def training_runs() -> list[dict[str, Any]]:
                 ready = kind == "best" and status == "completed" and job_id in ready_model_ids
                 checkpoints.append({
                     "id": f"{job_id}-{kind}",
+                    "ownerRunId": job_id,
                     "kind": kind,
                     "filename": path.name,
                     "sizeBytes": path.stat().st_size,
                     "lastModifiedAt": checkpoint_timestamp(path),
+                    "epoch": job.get("bestEpoch") if kind == "best" else job.get("epoch"),
+                    "metrics": job.get("bestMetrics", {}) if kind == "best" else job.get("metrics", {}),
+                    "selectionMetric": job.get("selectionMetric") if kind == "best" else None,
+                    "inheritedCheckpointAt": inherited_checkpoint_metadata(metadata, job).get("modifiedAt") if kind == "last" else None,
                     "downloadUrl": f"/api/checkpoints/{job_id}-{kind}/download",
                     "downloadAllowed": status in FINAL_TRAINING_STATUSES,
                     "interim": status in ACTIVE_TRAINING_STATUSES,
@@ -183,6 +418,27 @@ def training_runs() -> list[dict[str, Any]]:
                 "epoch": job.get("epoch"),
                 "totalEpochs": job.get("totalEpochs") or job.get("epochs"),
                 "lastCheckpointUpdatedAt": last_checkpoint_update,
+                "elapsedSeconds": job.get("elapsedSeconds"),
+                "resources": job.get("resources", {}),
+                "resourceSampledAt": job.get("resourceSampledAt"),
+                "stale": is_stale_job(job, status),
+                "bestMetrics": job.get("bestMetrics", {}),
+                "latestMetrics": job.get("metrics", {}),
+                "checkpointLineage": {"parentRunId": resumed_parent(metadata, job)[0], "resumedFrom": job.get("checkpointId"), "resumeParentEpoch": job.get("resumeParentEpoch") if job.get("resumeParentEpoch") is not None else resumed_parent(metadata, job)[1]},
+                "resumedBy": job.get("resumedBy"),
+                "inheritedCheckpoint": inherited_checkpoint_metadata(metadata, job),
+                "bestEpoch": job.get("bestEpoch"),
+                "selectionMetric": job.get("selectionMetric"),
+                "testMetrics": job.get("testMetrics", {}),
+                "averageEpochDurationSeconds": job.get("averageEpochDurationSeconds"),
+                "recentEpochDurationSeconds": job.get("recentEpochDurationSeconds"),
+                "estimatedRemainingSeconds": job.get("estimatedRemainingSeconds"),
+                "recentTrainingSpeed": job.get("recentTrainingSpeed", {}),
+                "environment": job.get("environment", {}),
+                "config": recorded_training_config(metadata, job),
+                "datasetFingerprint": job.get("datasetFingerprint"),
+                "datasetDiagnostics": job.get("datasetDiagnostics", {}),
+                "failureReason": job.get("failureReason"),
                 "checkpoints": checkpoints,
             })
         except (OSError, ValueError, KeyError, TypeError):
@@ -332,10 +588,10 @@ def label_for(image: Path, image_root: Path, labels_root: Path) -> Path:
     return label
 
 
-def validate_label(path: Path) -> int:
+def validated_boxes(path: Path) -> list[tuple[float, float, float, float]]:
     if not path.is_file():
-        return 0
-    count = 0
+        return []
+    boxes: list[tuple[float, float, float, float]] = []
     for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
         if not line.strip():
             continue
@@ -348,15 +604,42 @@ def validate_label(path: Path) -> int:
             raise ValueError(f"Expected class 0 and five YOLO values at {path.name}:{number}")
         if width <= 0 or height <= 0 or min(cx - width / 2, cy - height / 2) < 0 or max(cx + width / 2, cy + height / 2) > 1:
             raise ValueError(f"Out-of-range YOLO box at {path.name}:{number}")
-        count += 1
-    return count
+        boxes.append((cx, cy, width, height))
+    return boxes
+
+
+def validate_label(path: Path) -> int:
+    return len(validated_boxes(path))
 
 
 def advance_batch_count(current: int, total: int) -> int:
     return min(max(0, current) + 1, max(0, total))
 
 
-def build_training_dataset(job_id: str) -> tuple[Path, dict[str, int], str, int]:
+def histogram(values: list[float], edges: list[float]) -> list[dict[str, Any]]:
+    result = []
+    for index, lower in enumerate(edges[:-1]):
+        upper = edges[index + 1]
+        result.append({"range": f"{lower:g}–{upper:g}", "count": sum(lower <= value < upper for value in values)})
+    result.append({"range": f"≥{edges[-1]:g}", "count": sum(value >= edges[-1] for value in values)})
+    return result
+
+
+def update_epoch_timing(job: dict[str, Any], points: list[dict[str, Any]], total_epochs: int) -> None:
+    durations = [float(point["epochDurationSeconds"]) for point in points if isinstance(point.get("epochDurationSeconds"), (int, float)) and point["epochDurationSeconds"] > 0]
+    if not durations:
+        return
+    recent = durations[-5:]
+    average = sum(durations) / len(durations)
+    recent_average = sum(recent) / len(recent)
+    remaining_epochs = max(0, total_epochs - int(job.get("epoch") or 0))
+    job["averageEpochDurationSeconds"] = average
+    job["recentEpochDurationSeconds"] = recent_average
+    job["estimatedRemainingSeconds"] = round(remaining_epochs * recent_average)
+    job["recentTrainingSpeed"] = {"completedEpochsPerHour": round(3600 / recent_average, 3), "windowEpochs": len(recent), "imagesPerSecond": None, "note": "Epoch wall time includes validation; image throughput is not estimated."}
+
+
+def build_training_dataset(job_id: str) -> tuple[Path, dict[str, int], str, int, dict[str, Any]]:
     image_root, labels_root = DATASET_ROOT / "images", DATASET_ROOT / "labels"
     if not image_root.is_dir() or not labels_root.is_dir():
         raise ValueError("Expected a YOLO dataset with images/ and labels/ folders.")
@@ -365,16 +648,30 @@ def build_training_dataset(job_id: str) -> tuple[Path, dict[str, int], str, int]
         raise ValueError("At least three supported images are required to create train/validation/test splits.")
     groups: dict[str, list[Path]] = {}
     boxes, skipped, fingerprint = 0, 0, hashlib.sha256()
+    label_summary: dict[str, Any] = {"sourceImageCount": len(images), "missingLabelFiles": 0, "invalidLabelFiles": 0, "emptyLabelFiles": 0, "validLabelFiles": 0, "widths": [], "heights": [], "areas": [], "boxesPerImage": [], "invalidSamples": []}
     for image in images:
         label = label_for(image, image_root, labels_root)
-        try:
-            image_boxes = validate_label(label)
-        except (OSError, ValueError):
-            skipped += 1
-            continue
         if not label.is_file():
             skipped += 1
+            label_summary["missingLabelFiles"] += 1
             continue
+        try:
+            image_box_rows = validated_boxes(label)
+        except (OSError, ValueError) as error:
+            skipped += 1
+            label_summary["invalidLabelFiles"] += 1
+            if len(label_summary["invalidSamples"]) < 30:
+                label_summary["invalidSamples"].append({"image": image.relative_to(image_root).as_posix(), "reason": str(error)[:240]})
+            continue
+        image_boxes = len(image_box_rows)
+        label_summary["validLabelFiles"] += 1
+        if image_boxes == 0:
+            label_summary["emptyLabelFiles"] += 1
+        label_summary["boxesPerImage"].append({"image": image.relative_to(image_root).as_posix(), "count": image_boxes})
+        for _, _, width, height in image_box_rows:
+            label_summary["widths"].append(width)
+            label_summary["heights"].append(height)
+            label_summary["areas"].append(width * height)
         boxes += image_boxes
         stat = image.stat()
         fingerprint.update(f"{image.relative_to(image_root).as_posix()}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode())
@@ -392,6 +689,7 @@ def build_training_dataset(job_id: str) -> tuple[Path, dict[str, int], str, int]
         test_count, val_count = 0, 1
     splits = {"test": set(group_names[:test_count]), "val": set(group_names[test_count:test_count + val_count])}
     splits["train"] = set(group_names) - splits["test"] - splits["val"]
+    cross_split_groups = (splits["train"] & splits["val"]) | (splits["train"] & splits["test"]) | (splits["val"] & splits["test"])
     dataset_dir = RUNS_DIR / "jobs" / job_id / "dataset"
     if dataset_dir.exists():
         shutil.rmtree(dataset_dir)
@@ -416,7 +714,23 @@ def build_training_dataset(job_id: str) -> tuple[Path, dict[str, int], str, int]
     # datasets_dir (often /app/datasets), not against this YAML's directory.
     # An explicit mounted snapshot path keeps training independent of that setting.
     yaml_path.write_text(f"path: {json.dumps(str(dataset_dir.resolve()))}\ntrain: images/train\nval: images/val\ntest: images/test\nnames:\n  0: container\n", encoding="utf-8")
-    return yaml_path, counts, fingerprint.hexdigest(), skipped
+    per_image = sorted((item["count"] for item in label_summary["boxesPerImage"]))
+    median_boxes = per_image[len(per_image) // 2] if per_image else 0
+    deviations = sorted(abs(count - median_boxes) for count in per_image)
+    mad = deviations[len(deviations) // 2] if deviations else 0
+    many_threshold = max(10, median_boxes + 3 * max(1, mad))
+    few_threshold = max(0, median_boxes - 3 * max(1, mad))
+    normalized_widths, normalized_heights, normalized_areas = label_summary.pop("widths"), label_summary.pop("heights"), label_summary.pop("areas")
+    label_summary["boxCount"] = len(normalized_areas)
+    label_summary["boxesPerImage"] = {"minimum": min(per_image, default=0), "median": median_boxes, "maximum": max(per_image, default=0), "imagesWithNoBoxes": sum(count == 0 for count in per_image), "imagesWithOneBox": sum(count == 1 for count in per_image), "unusuallyFewThreshold": few_threshold, "unusuallyFewImages": [item["image"] for item in label_summary["boxesPerImage"] if item["count"] <= few_threshold][:30], "unusuallyManyThreshold": many_threshold, "unusuallyManyImages": [item["image"] for item in label_summary["boxesPerImage"] if item["count"] >= many_threshold][:30]}
+    label_summary["normalizedBoxWidthDistribution"] = histogram(normalized_widths, [0, 0.05, 0.1, 0.25, 0.5, 1])
+    label_summary["normalizedBoxHeightDistribution"] = histogram(normalized_heights, [0, 0.05, 0.1, 0.25, 0.5, 1])
+    label_summary["normalizedBoxAreaDistribution"] = {"small_lt_1_percent": sum(value < 0.01 for value in normalized_areas), "medium_1_to_10_percent": sum(0.01 <= value < 0.1 for value in normalized_areas), "large_gte_10_percent": sum(value >= 0.1 for value in normalized_areas), "definition": "Bounding-box area as a fraction of image area; small <1%, medium 1–10%, large ≥10%."}
+    label_summary["duplicateImageCheck"] = {"performed": False, "reason": "Exact image hashing was skipped to avoid an additional full read of the large source dataset during training preparation."}
+    label_summary["splitLeakageCheck"] = {"grouping": "Source image filename stem; terminal _cropped suffix removed.", "seed": 42, "groupCount": len(group_names), "groupsInMultipleSplits": len(cross_split_groups), "passed": not cross_split_groups}
+    label_summary["fingerprintAlgorithm"] = "SHA-256 of relative image path, image byte size, image mtime, and label contents. Image contents are not read for the fingerprint."
+    diagnostics = {"labelValidation": label_summary, "splitStrategy": "Deterministic 80/10/10 split by source-image filename group, keeping _cropped derivatives together.", "splitSeed": 42, "splitCounts": counts, "fingerprintAlgorithm": label_summary["fingerprintAlgorithm"]}
+    return yaml_path, counts, fingerprint.hexdigest(), skipped, diagnostics
 
 
 def train_worker(job_id: str, request: TrainRequest) -> None:
@@ -425,8 +739,8 @@ def train_worker(job_id: str, request: TrainRequest) -> None:
     try:
         job.update(status="preparing", startedAt=job.get("startedAt") or utc_now(), updatedAt=utc_now(), message="Validating labels and creating leakage-aware dataset splits.")
         save_job(job)
-        yaml_path, split_counts, fingerprint, skipped_images = build_training_dataset(job_id)
-        job.update(status="running", updatedAt=utc_now(), message=f"Training on CPU. {skipped_images} images with missing or invalid labels were excluded. The first run downloads YOLO26n weights.", splitCounts=split_counts, skippedImages=skipped_images, datasetFingerprint=fingerprint)
+        yaml_path, split_counts, fingerprint, skipped_images, dataset_diagnostics = build_training_dataset(job_id)
+        job.update(status="running", updatedAt=utc_now(), message=f"Training on CPU. {skipped_images} images with missing or invalid labels were excluded. The first run downloads YOLO26n weights.", splitCounts=split_counts, skippedImages=skipped_images, datasetFingerprint=fingerprint, datasetDiagnostics=dataset_diagnostics)
         save_job(job)
         from ultralytics import YOLO
         checkpoint_path = None
@@ -440,8 +754,16 @@ def train_worker(job_id: str, request: TrainRequest) -> None:
             if request.initMode == "resume":
                 job["checkpointOutputDir"] = str(checkpoint_path.parent)
                 job["resumedFromJobId"] = checkpoint.get("jobId")
+                source_stat = checkpoint_path.stat()
+                job["inheritedCheckpoint"] = {"runId": checkpoint.get("jobId"), "path": str(checkpoint_path), "sizeBytes": source_stat.st_size, "modifiedAt": datetime.fromtimestamp(source_stat.st_mtime, timezone.utc).isoformat(), "capturedAt": utc_now()}
         initial_model = str(checkpoint_path) if checkpoint_path else request.baseModel
         model = YOLO(initial_model)
+        try:
+            import torch
+            import ultralytics
+            environment = {"python": platform.python_version(), "platform": platform.platform(), "torch": torch.__version__, "ultralytics": ultralytics.__version__, "application": app.version}
+        except Exception:
+            environment = {"python": platform.python_version(), "platform": platform.platform(), "application": app.version}
         job_dir = RUNS_DIR / "jobs" / job_id
         if request.initMode == "base":
             start_message = f"Starting from {request.baseModel}; its weights download if they are not cached."
@@ -451,13 +773,25 @@ def train_worker(job_id: str, request: TrainRequest) -> None:
             start_message = f"Fine-tuning weights from {checkpoint_path.name} as a new training run."
         job["message"] = start_message
         job["initialModel"] = str(checkpoint_path) if checkpoint_path else request.baseModel
+        job["parentRunId"] = checkpoint.get("jobId") if request.initMode == "resume" and checkpoint else None
+        if request.initMode == "resume" and checkpoint:
+            parent_csv = results_csv_path(RUNS_DIR / "jobs" / str(checkpoint.get("jobId")) / "job.json", json.loads((RUNS_DIR / "jobs" / str(checkpoint.get("jobId")) / "job.json").read_text(encoding="utf-8")))
+            parent_rows = csv_epoch_metrics(parent_csv)
+            parent_job = json.loads((RUNS_DIR / "jobs" / str(checkpoint.get("jobId")) / "job.json").read_text(encoding="utf-8"))
+            job["resumeParentEpoch"] = int(parent_job.get("epoch") or max((int(row["epoch"]) for row in parent_rows), default=int(checkpoint.get("epoch") or 0)))
+        job["environment"] = environment
+        job["config"] = {"mode": request.initMode, "initialModel": str(checkpoint_path) if checkpoint_path else request.baseModel, "datasetYaml": str(yaml_path), "epochs": request.epochs, "imageSize": request.imageSize, "batch": request.batch, "device": "cpu", "workers": 0, "cache": False, "amp": False, "patience": 20, "seed": 42, "deterministic": True, "optimizer": "Ultralytics default (actual runtime optimizer is recorded after trainer initialization)"}
+        job.setdefault("events", [])
+        append_job_event(job, "info", start_message, "training")
         save_job(job)
 
         last_progress_save = 0.0
+        last_resource_sample = 0.0
         train_batches_seen = 0
+        previous_cpu_sample: dict[str, Any] | None = None
 
         def update_phase(phase: str, current: int, total: int, epoch: int | None = None, force: bool = False) -> None:
-            nonlocal last_progress_save
+            nonlocal last_progress_save, last_resource_sample, previous_cpu_sample
             now = time.monotonic()
             phases = job.setdefault("phaseProgress", {})
             entry = phases.setdefault(phase, {"epoch": epoch or 0, "current": 0, "total": max(0, total), "status": "waiting"})
@@ -470,6 +804,18 @@ def train_worker(job_id: str, request: TrainRequest) -> None:
                 entry["status"] = "running"
             job["currentStage"] = phase
             job["updatedAt"] = utc_now()
+            if force or now - last_resource_sample >= 10.0:
+                resources, previous_cpu_sample = resource_sample(previous_cpu_sample)
+                if resources:
+                    job["resources"] = resources
+                    job["resourceSampledAt"] = utc_now()
+                last_resource_sample = now
+            if job.get("startedAt"):
+                try:
+                    start = datetime.fromisoformat(str(job["startedAt"]).replace("Z", "+00:00"))
+                    job["elapsedSeconds"] = max(0, int((datetime.now(timezone.utc) - start).total_seconds()))
+                except ValueError:
+                    pass
             if force or now - last_progress_save >= 3.0 or (total > 0 and current >= total):
                 save_job(job)
                 last_progress_save = now
@@ -510,8 +856,31 @@ def train_worker(job_id: str, request: TrainRequest) -> None:
             update_phase(phase, total, total, int(job.get("epoch", 0)), force=True)
 
         def on_epoch_end(trainer: Any) -> None:
-            metrics = {str(k): float(v) for k, v in getattr(trainer, "metrics", {}).items() if isinstance(v, (int, float))}
-            job.update(epoch=int(getattr(trainer, "epoch", -1)) + 1, totalEpochs=request.epochs, metrics=metrics, updatedAt=utc_now())
+            metrics = json_safe({str(k): float(v) for k, v in getattr(trainer, "metrics", {}).items() if isinstance(v, (int, float))})
+            metadata = job_path(job_id)
+            epoch_rows = csv_epoch_metrics(results_csv_path(metadata, job))
+            if epoch_rows:
+                job["epochMetrics"] = merge_epoch_metrics(job, epoch_rows, utc_now())
+                job["metricsUpdatedAt"] = utc_now()
+            trainer_args = getattr(trainer, "args", None)
+            if trainer_args is not None:
+                job["config"] = json_safe(vars(trainer_args))
+            current_epoch = int(getattr(trainer, "epoch", -1)) + 1
+            job.update(epoch=current_epoch, totalEpochs=request.epochs, metrics=metrics, updatedAt=utc_now())
+            update_epoch_timing(job, job.get("epochMetrics", []), request.epochs)
+            append_job_event(job, "info", f"Epoch {current_epoch} completed.", "training")
+            fitness = getattr(trainer, "fitness", None)
+            best_fitness = getattr(trainer, "best_fitness", None)
+            if fitness is not None:
+                job["latestFitness"] = json_safe(fitness)
+            if best_fitness is not None:
+                job["bestFitness"] = json_safe(best_fitness)
+                if fitness is not None and math.isclose(float(fitness), float(best_fitness), rel_tol=1e-9, abs_tol=1e-12):
+                    job["bestMetrics"] = (job.get("epochMetrics") or [{}])[-1].get("metrics", metrics).copy()
+                    job["bestEpoch"] = current_epoch
+                    job["selectionMetric"] = {"name": "Ultralytics trainer.best_fitness / trainer.fitness", "value": json_safe(best_fitness), "detail": "Recorded from the installed trainer; the UI does not infer this criterion from a displayed metric name."}
+            if current_epoch == 1 and trainer_args is not None:
+                job["optimizer"] = str(getattr(getattr(trainer, "optimizer", None), "__class__", type(None)).__name__)
             save_job(job)
 
         model.add_callback("on_train_epoch_start", on_train_epoch_start)
@@ -533,13 +902,25 @@ def train_worker(job_id: str, request: TrainRequest) -> None:
         test_model.add_callback("on_val_batch_end", on_val_batch_end)
         test_model.add_callback("on_val_end", on_val_end)
         test_result = test_model.val(data=str(yaml_path), split="test", imgsz=request.imageSize, batch=request.batch, device="cpu", workers=0, plots=True, verbose=False)
-        test_metrics = {str(key): float(value) for key, value in getattr(test_result, "results_dict", {}).items() if isinstance(value, (int, float))}
+        test_metrics = json_safe({str(key): float(value) for key, value in getattr(test_result, "results_dict", {}).items() if isinstance(value, (int, float))})
         completed_at = utc_now()
-        job.update(status="completed", evaluatingTest=False, currentStage="complete", updatedAt=completed_at, completedAt=completed_at, finishedAt=completed_at, message="Training and final test evaluation completed. The best checkpoint is ready for detection.", checkpoint=str(best), epoch=request.epochs, testMetrics=test_metrics)
+        metadata = job_path(job_id)
+        epoch_rows = csv_epoch_metrics(results_csv_path(metadata, job))
+        if epoch_rows:
+            job["epochMetrics"] = merge_epoch_metrics(job, epoch_rows, completed_at)
+        job.update(status="completed", evaluatingTest=False, currentStage="complete", updatedAt=completed_at, completedAt=completed_at, finishedAt=completed_at, elapsedSeconds=job.get("elapsedSeconds") or int((datetime.now(timezone.utc) - datetime.fromisoformat(job["startedAt"])).total_seconds()), message="Training and final test evaluation completed. The best checkpoint is ready for detection.", checkpoint=str(best), epoch=request.epochs, testMetrics=test_metrics)
+        append_job_event(job, "info", "Training and final test evaluation completed.", "training")
         save_job(job)
     except Exception as error:
         finished_at = utc_now()
-        job.update(status="failed", updatedAt=finished_at, finishedAt=finished_at, message=str(error)[:1200])
+        elapsed = job.get("elapsedSeconds")
+        if job.get("startedAt"):
+            try:
+                elapsed = int((datetime.now(timezone.utc) - datetime.fromisoformat(str(job["startedAt"]).replace("Z", "+00:00"))).total_seconds())
+            except ValueError:
+                pass
+        job.update(status="failed", updatedAt=finished_at, finishedAt=finished_at, elapsedSeconds=elapsed, message=str(error)[:1200], failureReason=traceback.format_exc()[-8000:])
+        append_job_event(job, "error", str(error), "training")
         save_job(job)
     finally:
         with _lock:
@@ -548,7 +929,7 @@ def train_worker(job_id: str, request: TrainRequest) -> None:
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "project": "AI-VIsion-demo"}
+    return {"status": "ok", "project": "AI-VIsion-demo", "readOnly": OBSERVABILITY_ONLY}
 
 
 @app.get("/api/dataset")
@@ -577,6 +958,8 @@ def models():
 
 @app.post("/api/checkpoints/upload")
 async def upload_checkpoint(file: UploadFile = File(...)):
+    if OBSERVABILITY_ONLY:
+        raise HTTPException(403, "This observability instance is read-only.")
     filename = Path(file.filename or "checkpoint.pt").name
     if Path(filename).suffix.lower() != ".pt":
         raise HTTPException(400, "Upload a PyTorch .pt checkpoint")
@@ -640,6 +1023,8 @@ async def detect(file: UploadFile = File(...), modelId: str | None = None, confi
 @app.post("/api/training")
 def start_training(request: TrainRequest):
     global _active_training
+    if OBSERVABILITY_ONLY:
+        raise HTTPException(403, "This observability instance is read-only. Start training from the main app after the current run finishes.")
     with _lock:
         if _active_training:
             raise HTTPException(409, "A training job is already active")
@@ -704,6 +1089,8 @@ def export_worker(export_id: str, request: ExportRequest) -> None:
 @app.post("/api/checkpoints/{checkpoint_id}/export/onnx")
 def start_onnx_export(checkpoint_id: str, request: ExportRequest):
     global _active_export
+    if OBSERVABILITY_ONLY:
+        raise HTTPException(403, "This observability instance is read-only.")
     resolve_checkpoint(checkpoint_id)
     try:
         import onnx  # noqa: F401
@@ -770,9 +1157,33 @@ def training_status(job_id: str):
     return read_job(job_id)
 
 
+@app.get("/api/training/{job_id}/metrics")
+def training_metrics(job_id: str):
+    return metric_history(job_id)
+
+
+@app.get("/api/training/{job_id}/logs")
+def training_logs(job_id: str):
+    job = read_job(job_id)
+    metadata = job_path(job_id)
+    log_files = [metadata.parent / "training.log", results_csv_path(metadata, job).parent / "results.csv"]
+    content = []
+    for path in log_files:
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            content.append({"name": path.name, "path": str(path.relative_to(RUNS_DIR)), "tail": lines[-300:]})
+        except OSError:
+            continue
+    return {"runId": job_id, "events": job.get("events", []), "failureReason": job.get("failureReason"), "files": content}
+
+
 @app.on_event("startup")
 def recover_jobs():
     global _active_training
+    if OBSERVABILITY_ONLY:
+        return
     jobs_dir = RUNS_DIR / "jobs"
     if not jobs_dir.is_dir():
         return
@@ -782,10 +1193,12 @@ def recover_jobs():
             if job.get("status") in {"queued", "preparing", "running", "evaluating"}:
                 interrupted_at = utc_now()
                 job.update(status="interrupted", updatedAt=interrupted_at, finishedAt=interrupted_at, message="Server restarted during training. A saved last checkpoint may be available for a future resume feature.")
+                append_job_event(job, "warning", "Server restarted while the run was active; status changed to interrupted.", "recovery")
                 save_job(job)
         except (OSError, ValueError):
             continue
     _active_training = None
+    backfill_job_metrics()
     exports_dir = RUNS_DIR / "exports"
     if exports_dir.is_dir():
         for metadata in exports_dir.glob("[a-f0-9]" * 32 + ".json"):
