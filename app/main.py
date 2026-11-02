@@ -10,11 +10,13 @@ import random
 import re
 import resource as resource_usage
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
 import traceback
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,7 +36,9 @@ _model_lock = threading.Lock()
 _loaded_model: tuple[str, Any] | None = None
 _export_lock = threading.Lock()
 _active_export: str | None = None
+_active_classifier: str | None = None
 OBSERVABILITY_ONLY = os.getenv("OBSERVABILITY_ONLY", "0").lower() in {"1", "true", "yes"}
+LABELER_DB = Path(os.getenv("LABELER_DB", "/labeler-data/container-labeler.sqlite3"))
 app = FastAPI(title="AI Vision Demo", version="1.0.0")
 
 
@@ -951,9 +955,348 @@ def dataset_file(path: str):
     return FileResponse(safe_dataset_path(path))
 
 
+def dataset_explorer_page(page: int, page_size: int) -> tuple[int, int]:
+    return max(1, page), max(1, min(100, page_size))
+
+
+@app.get("/api/dataset/explorer/detection")
+def dataset_explorer_detection(page: int = 1, pageSize: int = 50, search: str = "", annotation: str = "all"):
+    page, page_size = dataset_explorer_page(page, pageSize)
+    if annotation not in {"all", "annotated", "unannotated"}:
+        raise HTTPException(400, "Invalid annotation filter")
+    image_root = DATASET_ROOT / "images"
+    if not image_root.is_dir():
+        image_root = DATASET_ROOT
+    labels_root = DATASET_ROOT / "labels"
+    records = []
+    total_boxes = annotated_images = total_images = 0
+    images = sorted((p for p in image_root.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED), key=lambda p: p.relative_to(image_root).as_posix().casefold())
+    query = search.casefold().strip()
+    for image in images:
+        total_images += 1
+        relative = image.relative_to(DATASET_ROOT).as_posix()
+        label = label_for(image, image_root, labels_root)
+        error = None
+        try:
+            boxes = validated_boxes(label)
+        except (OSError, UnicodeError, ValueError) as exc:
+            boxes, error = [], str(exc)
+        count = len(boxes)
+        total_boxes += count
+        annotated_images += count > 0
+        status = "invalid" if error else "annotated" if count else "unannotated"
+        if query and query not in image.name.casefold():
+            continue
+        if annotation != "all" and status != annotation:
+            continue
+        records.append({"path": relative, "filename": image.name, "annotationStatus": status, "boxCount": count, "boxes": boxes, "annotationError": error})
+    total = len(records)
+    start = (page - 1) * page_size
+    return {"page": page, "pageSize": page_size, "total": total, "stats": {"totalImages": total_images, "annotatedImages": annotated_images, "unannotatedImages": max(0, total_images - annotated_images), "totalBoxes": total_boxes}, "items": records[start:start + page_size]}
+
+
+def classifier_dataset_records() -> list[dict[str, Any]]:
+    root = classifier_root() / "datasets"
+    records = []
+    if not root.is_dir():
+        return records
+    for metadata in root.glob("*/import.json"):
+        try:
+            info = json.loads(metadata.read_text(encoding="utf-8"))
+            dataset_id = metadata.parent.name
+            if not re.fullmatch(r"[a-f0-9]{32}", dataset_id):
+                continue
+            classes = {"1_container": 0, "2_containers": 0, "unclassified": 0}
+            for folder, key in (("1_container", "1_container"), ("2_containers", "2_containers"), ("unclassified", "unclassified"), ("Unclassified", "unclassified")):
+                directory = metadata.parent / folder
+                if directory.is_dir():
+                    classes[key] += sum(1 for p in directory.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED)
+            known = classes["1_container"] + classes["2_containers"]
+            total = known + classes["unclassified"]
+            records.append({"id": dataset_id, "name": info.get("sessionName") or info.get("source") or f"Classifier dataset · {dataset_id[:8]}", "source": info.get("source", "Imported classifier dataset"), "imageCount": total, "classCounts": classes, "createdAt": metadata.stat().st_mtime})
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return sorted(records, key=lambda row: (row["createdAt"], row["id"]), reverse=True)
+
+
+@app.get("/api/dataset/explorer/classification")
+def dataset_explorer_classification(datasetId: str | None = None, page: int = 1, pageSize: int = 50, search: str = "", label: str = "all"):
+    page, page_size = dataset_explorer_page(page, pageSize)
+    if label not in {"all", "1", "2", "unclassified"}:
+        raise HTTPException(400, "Invalid classification filter")
+    datasets = classifier_dataset_records()
+    selected = next((row for row in datasets if row["id"] == datasetId), None) if datasetId else (datasets[0] if datasets else None)
+    if datasetId and not selected:
+        raise HTTPException(404, "Classifier dataset not found")
+    if not selected:
+        return {"datasets": datasets, "dataset": None, "page": page, "pageSize": page_size, "total": 0, "stats": {"totalImages": 0, "oneContainer": 0, "twoContainers": 0, "unclassified": 0, "onePercent": 0, "twoPercent": 0}, "items": []}
+    root = classifier_root() / "datasets" / selected["id"]
+    folder_specs = (("1_container", "1"), ("2_containers", "2"), ("unclassified", "unclassified"), ("Unclassified", "unclassified"))
+    items = []
+    query = search.casefold().strip()
+    for folder, class_label in folder_specs:
+        directory = root / folder
+        if not directory.is_dir():
+            continue
+        for image in directory.rglob("*"):
+            if not image.is_file() or image.suffix.lower() not in SUPPORTED or (query and query not in image.name.casefold()):
+                continue
+            if label != "all" and class_label != label:
+                continue
+            rel = image.relative_to(root).as_posix()
+            resolved = image.resolve()
+            if not resolved.is_file() or not (resolved.is_relative_to(root.resolve()) or resolved.is_relative_to(DATASET_ROOT)):
+                continue
+            items.append({"path": rel, "filename": image.name, "label": class_label, "labelText": {"1": "1 container", "2": "2 containers", "unclassified": "Unclassified"}[class_label]})
+    items.sort(key=lambda row: row["filename"].casefold())
+    total_images = selected["imageCount"]
+    counts = selected["classCounts"]
+    return {"datasets": datasets, "dataset": selected, "page": page, "pageSize": page_size, "total": len(items), "stats": {"totalImages": total_images, "oneContainer": counts["1_container"], "twoContainers": counts["2_containers"], "unclassified": counts["unclassified"], "onePercent": round(counts["1_container"] * 100 / total_images, 1) if total_images else 0, "twoPercent": round(counts["2_containers"] * 100 / total_images, 1) if total_images else 0}, "items": items[(page - 1) * page_size:page * page_size]}
+
+
+@app.get("/api/dataset/explorer/classification/file")
+def dataset_explorer_classification_file(datasetId: str, path: str):
+    if not re.fullmatch(r"[a-f0-9]{32}", datasetId):
+        raise HTTPException(404, "Classifier dataset not found")
+    root = (classifier_root() / "datasets" / datasetId).resolve()
+    candidate = (root / path).resolve()
+    if not candidate.is_file() or not (candidate.is_relative_to(root) or candidate.is_relative_to(DATASET_ROOT)) or candidate.suffix.lower() not in SUPPORTED:
+        raise HTTPException(404, "Classifier image not found")
+    return FileResponse(candidate)
+
+
 @app.get("/api/models")
 def models():
-    return {"models": checkpoint_models(), "checkpoints": list_checkpoints(), "trainingRuns": training_runs()}
+    return {"models": checkpoint_models(), "checkpoints": list_checkpoints(), "trainingRuns": training_runs(), "classifiers": classifier_models(), "classifierRuns": classifier_runs()}
+
+
+def classifier_root() -> Path:
+    return RUNS_DIR / "classifiers"
+
+
+def classifier_runs() -> list[dict[str, Any]]:
+    result = []
+    for meta in (classifier_root() / "jobs").glob("*/job.json"):
+        try:
+            job = json.loads(meta.read_text(encoding="utf-8"))
+            for key in ("best.pt", "last.pt"):
+                job[key.replace(".pt", "Path")] = str(meta.parent / key) if (meta.parent / key).is_file() else None
+            result.append(job)
+        except (OSError, ValueError):
+            continue
+    return sorted(result, key=lambda row: row.get("createdAt", ""), reverse=True)
+
+
+def classifier_models() -> list[dict[str, Any]]:
+    return [{"id": row["id"], "name": f"{row.get('architecture','mobilenet_v3_small')} · {row['id'][:8]}", "createdAt": row.get("updatedAt"), "accuracy": row.get("bestAccuracy")} for row in classifier_runs() if row.get("status") == "completed" and row.get("bestPath") and Path(row["bestPath"]).is_file()]
+
+
+def save_classifier_job(job: dict[str, Any]) -> None:
+    directory = classifier_root() / "jobs" / job["id"]
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / "job.json"
+    temporary = target.with_suffix(".tmp")
+    with _lock:
+        if target.is_file():
+            try:
+                if json.loads(target.read_text(encoding="utf-8")).get("stopRequested"):
+                    job["stopRequested"] = True
+            except (OSError, ValueError):
+                pass
+        temporary.write_text(json.dumps(job, indent=2, allow_nan=False), encoding="utf-8")
+        os.replace(temporary, target)
+
+
+def classifier_stop_requested(run_id: str) -> bool:
+    path = classifier_root() / "jobs" / run_id / "job.json"
+    try:
+        return bool(json.loads(path.read_text(encoding="utf-8")).get("stopRequested"))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def classifier_worker(run_id: str) -> None:
+    global _active_classifier
+    root = classifier_root() / "jobs" / run_id
+    job = json.loads((root / "job.json").read_text(encoding="utf-8"))
+    try:
+        import torch
+        from torch import nn
+        from torch.utils.data import DataLoader, Subset
+        from torchvision import datasets, models, transforms
+        job.update(status="running", message="Preparing image classification data.", startedAt=utc_now()); save_classifier_job(job)
+        data_root = Path(job["datasetPath"])
+        transform = transforms.Compose([transforms.Resize((job["imageSize"], job["imageSize"])), transforms.ToTensor(), transforms.Normalize([.485,.456,.406],[.229,.224,.225])])
+        dataset = datasets.ImageFolder(data_root, transform=transform)
+        if dataset.classes != ["1_container", "2_containers"] or len(dataset) < 10:
+            raise ValueError("Dataset must contain at least 10 readable images across 1_container/ and 2_containers/.")
+        counts = {name: sum(1 for _, label in dataset.samples if dataset.classes[label] == name) for name in dataset.classes}
+        group_file=data_root/"groups.json"
+        groups=json.loads(group_file.read_text()) if group_file.is_file() else {}
+        grouped: dict[str,list[int]]={}
+        for index,(path,_) in enumerate(dataset.samples): grouped.setdefault(groups.get(Path(path).name,Path(path).name),[]).append(index)
+        keys=sorted(grouped); random.Random(42).shuffle(keys)
+        train_cut=max(1,int(len(keys)*.8)); val_cut=max(train_cut+1,int(len(keys)*.9))
+        train_indices=[i for group in keys[:train_cut] for i in grouped[group]]; val_indices=[i for group in keys[train_cut:val_cut] for i in grouped[group]]; test_indices=[i for group in keys[val_cut:] for i in grouped[group]]
+        n_train,n_val,n_test=len(train_indices),len(val_indices),len(test_indices)
+        if min(n_train,n_val,n_test) < 1: raise ValueError("Need enough images for train/validation/test splits.")
+        train_set,val_set,test_set=Subset(dataset,train_indices),Subset(dataset,val_indices),Subset(dataset,test_indices)
+        job.update(datasetSize=len(dataset), classCounts=counts, splitCounts={"train":n_train,"validation":n_val,"test":n_test}, splitStrategy="Deterministic 80/10/10 by source image/capture group", message="Preparing classifier training."); save_classifier_job(job)
+        arch=job["architecture"]
+        net = models.mobilenet_v3_small(weights=None) if arch == "mobilenet_v3_small" else models.mobilenet_v3_large(weights=None)
+        net.classifier[-1] = nn.Linear(net.classifier[-1].in_features, 2)
+        device=torch.device("cuda" if job["device"]=="cuda" and torch.cuda.is_available() else "cpu"); net.to(device)
+        criterion=nn.CrossEntropyLoss(); optimizer=torch.optim.AdamW(net.parameters(),lr=job["learningRate"])
+        loader=lambda subset,shuffle: DataLoader(subset,batch_size=job["batchSize"],shuffle=shuffle,num_workers=0)
+        train_batches=len(loader(train_set,False))
+        best=0.0; history=[]
+        for epoch in range(job["epochs"]):
+            if classifier_stop_requested(run_id):
+                job.update(status="stopped",finishedAt=utc_now(),message="Training stopped by user."); save_classifier_job(job); return
+            net.train(); total=correct=0; loss_sum=0.0
+            for batch_index,(x,y) in enumerate(loader(train_set,True),start=1):
+                if classifier_stop_requested(run_id):
+                    job.update(status="stopped",finishedAt=utc_now(),epoch=epoch,message="Training stopped by user during the current epoch."); save_classifier_job(job); return
+                x,y=x.to(device),y.to(device); optimizer.zero_grad(); logits=net(x); loss=criterion(logits,y); loss.backward(); optimizer.step(); loss_sum+=loss.item()*y.size(0); correct+=(logits.argmax(1)==y).sum().item(); total+=y.size(0)
+                if batch_index % 25 == 0 or batch_index == train_batches:
+                    job.update(epoch=epoch,status="running",currentStage="train",batchProgress={"current":batch_index,"total":train_batches},updatedAt=utc_now(),message=f"Epoch {epoch+1}/{job['epochs']} · batch {batch_index}/{train_batches}")
+                    save_classifier_job(job)
+            net.eval(); vloss=0.; vy=[]; vp=[]
+            with torch.no_grad():
+                for x,y in loader(val_set,False):
+                    logits=net(x.to(device)); vloss+=criterion(logits,y.to(device)).item()*y.size(0); vy.extend(y.tolist()); vp.extend(logits.argmax(1).cpu().tolist())
+            tp=sum(a==b==1 for a,b in zip(vy,vp)); fp=sum(a==1 and b==0 for a,b in zip(vy,vp)); fn=sum(a==0 and b==1 for a,b in zip(vy,vp)); precision=tp/max(1,tp+fp); recall=tp/max(1,tp+fn); f1=2*precision*recall/max(1e-12,precision+recall); acc=sum(a==b for a,b in zip(vy,vp))/len(vy)
+            item={"epoch":epoch+1,"trainLoss":loss_sum/total,"validationLoss":vloss/len(vy),"accuracy":acc,"precision":precision,"recall":recall,"f1":f1,"confusionMatrix":[[sum(a==0 and b==0 for a,b in zip(vy,vp)),sum(a==0 and b==1 for a,b in zip(vy,vp))],[sum(a==1 and b==0 for a,b in zip(vy,vp)),sum(a==1 and b==1 for a,b in zip(vy,vp))]]}; history.append(item)
+            torch.save({"state_dict":net.cpu().state_dict(),"architecture":arch,"classes":dataset.classes,"imageSize":job["imageSize"]},root/"last.pt"); net.to(device)
+            if acc>=best: best=acc; torch.save({"state_dict":net.cpu().state_dict(),"architecture":arch,"classes":dataset.classes,"imageSize":job["imageSize"]},root/"best.pt"); net.to(device)
+            job.update(epoch=epoch+1,status="running",metrics=item,history=history,bestAccuracy=best,updatedAt=utc_now(),message=f"Epoch {epoch+1}/{job['epochs']}"); save_classifier_job(job)
+        net.eval(); predictions=[]; actual=[]
+        with torch.no_grad():
+            for x,y in loader(test_set,False): predictions.extend(net(x.to(device)).argmax(1).cpu().tolist()); actual.extend(y.tolist())
+        job.update(status="completed",testMetrics={"accuracy":sum(a==b for a,b in zip(actual,predictions))/len(actual)},updatedAt=utc_now(),message="Training, validation, and held-out testing completed."); save_classifier_job(job)
+    except Exception as error:
+        job.update(status="failed",message=str(error)[:1000],updatedAt=utc_now()); save_classifier_job(job)
+    finally:
+        _active_classifier=None
+
+
+@app.post("/api/classifiers/import")
+async def import_classifier_dataset(file: UploadFile = File(...)):
+    if OBSERVABILITY_ONLY: raise HTTPException(403,"This observability instance is read-only.")
+    raw=await file.read(1024*1024*1024+1)
+    if not raw or len(raw)>1024*1024*1024: raise HTTPException(413,"Dataset archive is empty or exceeds 1 GB")
+    try:
+        archive=zipfile.ZipFile(__import__('io').BytesIO(raw)); members=archive.infolist()
+        if any(Path(m.filename).is_absolute() or ".." in Path(m.filename).parts for m in members): raise ValueError("Unsafe archive path")
+        manifest=next((m.filename for m in members if Path(m.filename).name=="labels.csv"),None)
+        if not manifest: raise ValueError("ZIP must contain labels.csv exported by Container-labeler")
+        import csv, io
+        rows=list(csv.DictReader(io.StringIO(archive.read(manifest).decode("utf-8-sig"))))
+        if not rows or not {"image_path","container_count"}.issubset(rows[0]): raise ValueError("labels.csv needs image_path and container_count columns")
+        dsid=uuid.uuid4().hex; target=classifier_root()/"datasets"/dsid; target.mkdir(parents=True,exist_ok=True)
+        seen=set(); invalid=[]; valid=0; groups={}
+        from PIL import Image
+        for row in rows:
+            image=row.get("image_path",""); label=row.get("container_count","")
+            if image in seen: invalid.append({"image":image,"error":"duplicate manifest entry"}); continue
+            seen.add(image)
+            if label not in {"1","2"}: invalid.append({"image":image,"error":f"invalid label {label!r}"}); continue
+            try:
+                info=next(m for m in members if m.filename==image)
+                payload=archive.read(info)
+                with Image.open(__import__('io').BytesIO(payload)) as im: im.verify()
+                basename=f"{hashlib.sha256(image.encode()).hexdigest()[:12]}-{Path(image).name}"
+                out=target/("1_container" if label=="1" else "2_containers")/basename; out.parent.mkdir(parents=True,exist_ok=True); out.write_bytes(payload); groups[basename]=row.get("source_image_path") or image; valid+=1
+            except Exception as error: invalid.append({"image":image,"error":str(error)[:180]})
+        counts={name:len(list((target/name).glob("*"))) for name in ("1_container","2_containers")}
+        if not valid: raise ValueError("No readable labeled images found")
+        meta={"datasetId":dsid,"path":str(target),"imageCount":valid,"classCounts":counts,"invalid":invalid}
+        (target/"import.json").write_text(json.dumps({**meta,"invalidCount":len(invalid)},indent=2),encoding="utf-8"); (target/"groups.json").write_text(json.dumps(groups),encoding="utf-8")
+        return meta
+    except HTTPException: raise
+    except Exception as error: raise HTTPException(400,f"Invalid classification dataset: {error}") from error
+
+
+@app.post("/api/classifiers/import-labeler")
+def import_labeler_dataset(request: dict[str, Any] | None = None):
+    if OBSERVABILITY_ONLY: raise HTTPException(403,"This observability instance is read-only.")
+    request=request or {}
+    if not LABELER_DB.is_file(): raise HTTPException(404,"Container-labeler database is not mounted")
+    try:
+        connection=sqlite3.connect(f"file:{LABELER_DB}?mode=ro",uri=True); connection.row_factory=sqlite3.Row
+        query="""SELECT t.id,t.root_name,COUNT(c.container_count) labeled,
+          SUM(c.container_count=1) one_count,SUM(c.container_count=2) two_count
+          FROM text_sessions t JOIN container_counts c ON c.session_id=t.id
+          JOIN text_annotations a ON a.session_id=t.id AND a.path=c.path
+          WHERE a.active=1 AND a.cached_crop_path IS NOT NULL AND c.container_count IN (1,2)
+          GROUP BY t.id ORDER BY labeled DESC"""
+        sessions=connection.execute(query).fetchall()
+        selected=request.get("sessionId")
+        session=next((row for row in sessions if row["id"]==selected),None) if selected else (sessions[0] if sessions else None)
+        if not session: raise ValueError("No labeled container count crops were found")
+        rows=connection.execute("""SELECT a.path,a.source_path,a.cached_crop_path,c.container_count
+          FROM text_annotations a JOIN container_counts c ON c.session_id=a.session_id AND c.path=a.path
+          WHERE a.session_id=? AND a.active=1 AND a.cached_crop_path IS NOT NULL AND c.container_count IN (1,2)
+          ORDER BY a.path""",(session["id"],)).fetchall()
+        connection.close()
+        dsid=uuid.uuid4().hex; target=classifier_root()/"datasets"/dsid; groups={}; invalid=[]; counts={"1_container":0,"2_containers":0}
+        for row in rows:
+            source=(DATASET_ROOT/row["cached_crop_path"]).resolve()
+            if not source.is_relative_to(DATASET_ROOT) or not source.is_file():
+                invalid.append({"image":row["cached_crop_path"],"error":"missing or unsafe crop path"}); continue
+            label="1_container" if row["container_count"]==1 else "2_containers"
+            filename=f"{hashlib.sha256(row['path'].encode()).hexdigest()[:12]}-{source.name}"
+            output=target/label/filename; output.parent.mkdir(parents=True,exist_ok=True); output.symlink_to(source)
+            groups[filename]=row["source_path"] or row["path"]; counts[label]+=1
+        total=sum(counts.values())
+        if not total: raise ValueError("No readable container crops found for the selected labeling session")
+        meta={"datasetId":dsid,"path":str(target),"imageCount":total,"classCounts":counts,"invalid":invalid,"source":"Container-labeler","sessionId":session["id"],"sessionName":session["root_name"]}
+        (target/"groups.json").write_text(json.dumps(groups),encoding="utf-8")
+        (target/"import.json").write_text(json.dumps({**meta,"invalidCount":len(invalid)},indent=2),encoding="utf-8")
+        return meta
+    except HTTPException: raise
+    except Exception as error: raise HTTPException(400,f"Could not import Container-labeler labels: {error}") from error
+
+
+@app.post("/api/classifiers/train")
+def start_classifier_training(request: dict[str,Any]):
+    global _active_classifier
+    if OBSERVABILITY_ONLY: raise HTTPException(403,"This observability instance is read-only.")
+    with _lock:
+        if _active_classifier: raise HTTPException(409,"A classifier training run is already active")
+        dataset_id=str(request.get("datasetId",""))
+        if not re.fullmatch(r"[a-f0-9]{32}",dataset_id): raise HTTPException(400,"Import a labeled ZIP dataset first")
+        meta=classifier_root()/"datasets"/dataset_id/"import.json"
+        if not meta.is_file(): raise HTTPException(404,"Imported dataset not found")
+        try: cfg=json.loads(meta.read_text()); epochs=max(1,min(200,int(request.get("epochs",30)))); batch=max(1,min(64,int(request.get("batchSize",16)))); size=max(96,min(512,int(request.get("imageSize",224)))); lr=float(request.get("learningRate",.001))
+        except Exception as e: raise HTTPException(400,"Invalid training configuration") from e
+        if not .000001<=lr<=.1: raise HTTPException(400,"Learning rate must be between 0.000001 and 0.1")
+        run_id=uuid.uuid4().hex; job={"id":run_id,"status":"queued","createdAt":utc_now(),"updatedAt":utc_now(),"datasetPath":cfg["path"],"datasetId":dataset_id,"datasetSize":cfg["imageCount"],"classCounts":cfg["classCounts"],"epochs":epochs,"batchSize":batch,"imageSize":size,"learningRate":lr,"architecture":request.get("architecture","mobilenet_v3_small"),"device":request.get("device","cpu"),"epoch":0}
+        if job["architecture"] not in {"mobilenet_v3_small","mobilenet_v3_large"}: raise HTTPException(400,"Unsupported architecture")
+        save_classifier_job(job); _active_classifier=run_id; threading.Thread(target=classifier_worker,args=(run_id,),daemon=True).start(); return job
+
+
+@app.get("/api/classifiers/runs/{run_id}")
+def get_classifier_run(run_id: str):
+    path=classifier_root()/"jobs"/run_id/"job.json"
+    if not re.fullmatch(r"[a-f0-9]{32}",run_id) or not path.is_file(): raise HTTPException(404,"Classifier run not found")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@app.post("/api/classifiers/runs/{run_id}/stop")
+def stop_classifier_run(run_id: str):
+    job=get_classifier_run(run_id)
+    if job["status"] not in ACTIVE_TRAINING_STATUSES: raise HTTPException(409,"Classifier run is not active")
+    job["stopRequested"]=True; save_classifier_job(job); return {"ok":True}
+
+
+@app.get("/api/classifiers/runs/{run_id}/download")
+def download_classifier(run_id: str, kind: str="best"):
+    job=get_classifier_run(run_id)
+    if job.get("status")!="completed" or kind not in {"best","last"}: raise HTTPException(404,"Completed classifier checkpoint not found")
+    path=classifier_root()/"jobs"/run_id/f"{kind}.pt"
+    if not path.is_file(): raise HTTPException(404,"Checkpoint file is missing")
+    return FileResponse(path,filename=f"{run_id}-{kind}.pt",media_type="application/octet-stream")
 
 
 @app.post("/api/checkpoints/upload")
@@ -987,7 +1330,7 @@ def download_checkpoint(checkpoint_id: str):
 
 
 @app.post("/api/detect")
-async def detect(file: UploadFile = File(...), modelId: str | None = None, confidence: float = 0.25):
+async def detect(file: UploadFile = File(...), modelId: str | None = None, classifierId: str | None = None, confidence: float = 0.25):
     suffix = Path(file.filename or "image.jpg").suffix.lower()
     if suffix not in SUPPORTED:
         raise HTTPException(400, "Upload a JPG, PNG, WebP, BMP or TIFF image")
@@ -1017,7 +1360,32 @@ async def detect(file: UploadFile = File(...), modelId: str | None = None, confi
         for box in results[0].boxes:
             x1, y1, x2, y2 = [float(value) for value in box.xyxy[0].tolist()]
             boxes.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "confidence": float(box.conf[0]), "className": "container"})
-    return {"width": width, "height": height, "boxes": boxes, "model": Path(checkpoint).name, "count": len(boxes)}
+    response = {"width": width, "height": height, "boxes": boxes, "model": Path(checkpoint).name, "count": len(boxes), "containerDetected": bool(boxes)}
+    if classifierId:
+        try:
+            if not boxes:
+                raise ValueError("No container area was detected; count classification was skipped")
+            descriptor=next((row for row in classifier_runs() if row.get("id")==classifierId and row.get("status")=="completed"),None)
+            if not descriptor: raise ValueError("Selected classifier is not a completed run")
+            import torch
+            from PIL import Image
+            from torchvision import models, transforms
+            saved=torch.load(descriptor["bestPath"],map_location="cpu",weights_only=True)
+            arch=saved["architecture"]; classifier=models.mobilenet_v3_small(weights=None) if arch=="mobilenet_v3_small" else models.mobilenet_v3_large(weights=None)
+            classifier.classifier[-1]=torch.nn.Linear(classifier.classifier[-1].in_features,2); classifier.load_state_dict(saved["state_dict"]); classifier.eval()
+            with Image.open(io.BytesIO(contents)) as source:
+                source=source.convert("RGB")
+                if boxes:
+                    # Use the full extent of all detected containers as the
+                    # classifier input. Passing these generator expressions
+                    # directly to int() raises TypeError at runtime.
+                    x1=max(0,min(int(min(b["x1"] for b in boxes)),source.width-1)); y1=max(0,min(int(min(b["y1"] for b in boxes)),source.height-1)); x2=max(x1+1,min(int(max(b["x2"] for b in boxes)),source.width)); y2=max(y1+1,min(int(max(b["y2"] for b in boxes)),source.height)); source=source.crop((x1,y1,x2,y2))
+                prep=transforms.Compose([transforms.Resize((saved["imageSize"],saved["imageSize"])),transforms.ToTensor(),transforms.Normalize([.485,.456,.406],[.229,.224,.225])]); tensor=prep(source).unsqueeze(0)
+            with torch.no_grad(): probs=torch.softmax(classifier(tensor),dim=1)[0].tolist()
+            idx=max(range(2),key=lambda i:probs[i]); response["classification"]={"count":idx+1,"confidence":probs[idx],"probabilities":{"1":probs[0],"2":probs[1]},"model":descriptor.get("name") or f"{descriptor.get('architecture','classifier')} · {descriptor.get('id',classifierId)[:8]}"}
+        except Exception as error:
+            response["classificationError"]=str(error)[:300]
+    return response
 
 
 @app.post("/api/training")
@@ -1198,6 +1566,16 @@ def recover_jobs():
         except (OSError, ValueError):
             continue
     _active_training = None
+    classifier_jobs = classifier_root() / "jobs"
+    if classifier_jobs.is_dir():
+        for metadata in classifier_jobs.glob("*/job.json"):
+            try:
+                classifier = json.loads(metadata.read_text(encoding="utf-8"))
+                if classifier.get("status") in ACTIVE_TRAINING_STATUSES:
+                    classifier.update(status="interrupted", updatedAt=utc_now(), message="Classifier worker stopped when the server process restarted.")
+                    save_classifier_job(classifier)
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
     backfill_job_metrics()
     exports_dir = RUNS_DIR / "exports"
     if exports_dir.is_dir():

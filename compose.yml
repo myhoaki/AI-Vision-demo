@@ -11,4 +11,5 @@ services:
       PORT: 8768
     volumes:
       - ../container-labeler/data/server_dataset/container_images_verified:/dataset:ro
+      - ../container-labeler/data:/labeler-data:ro
       - ./runs:/runs

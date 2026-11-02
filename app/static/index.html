@@ -4,7 +4,7 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#101914">
   <title>AI-VIsion-demo · Container detection</title>
-  <link rel="stylesheet" href="/static/style.css?v=5">
+  <link rel="stylesheet" href="/static/style.css?v=9">
 </head>
 <body>
   <header class="shell topbar">
@@ -23,26 +23,37 @@
       <div class="detect-layout">
         <div class="card input-card">
           <label class="dropzone" id="dropzone" for="imageFile"><span class="upload-icon">↑</span><strong>Choose or drop an image</strong><span>JPG, PNG, WebP or TIFF · up to 20 MB</span><input id="imageFile" type="file" accept="image/jpeg,image/png,image/webp,image/bmp,image/tiff"></label>
-          <div class="control-row"><label>Detector<select id="modelSelect"><option value="">Latest trained model</option></select></label><label>Confidence <span id="confidenceLabel">0.25</span><input id="confidence" type="range" min="0.05" max="0.90" step="0.05" value="0.25"></label></div>
+          <div class="control-row"><label>Detector<select id="modelSelect"><option value="">Latest trained model</option></select></label><label>Count classifier<select id="classifierSelect"><option value="">None · detection only</option></select></label><label>Confidence <span id="confidenceLabel">0.25</span><input id="confidence" type="range" min="0.05" max="0.90" step="0.05" value="0.25"></label></div>
           <button id="detectButton" class="button primary wide" disabled>Detect containers</button>
           <p class="muted small" id="detectHint">Train a detector first. The pretrained COCO checkpoint does not include a container class.</p>
         </div>
         <div class="card result-card"><div class="card-title"><div><p class="eyebrow">PREDICTION</p><h3 id="resultTitle">Waiting for an image</h3></div><span id="resultCount" class="count-badge">—</span></div>
           <div id="previewEmpty" class="preview-empty"><div class="empty-art">▧</div><p>Your image and container boxes will appear here.</p></div>
           <div id="previewFrame" class="preview-frame" hidden><img id="previewImage" alt="Image being analyzed"><canvas id="overlay"></canvas></div>
-          <div id="resultMeta" class="result-meta muted">Bounding-box results stay in this session.</div>
+          <div id="resultMeta" class="result-meta muted">Bounding-box results stay in this session.</div><div id="countResult" class="metric-rows" aria-live="polite"></div>
         </div>
       </div>
     </section>
 
     <section id="view-dataset" class="view" hidden>
-      <div class="section-heading"><div><p class="eyebrow">READ-ONLY SOURCE DATA</p><h2>Dataset explorer</h2><p>Browse training images and labels. Source files are mounted read-only and are never modified.</p></div><span class="pill green">Container · class 0</span></div>
-      <div class="dataset-summary" id="datasetSummary"></div>
-      <div id="datasetGrid" class="dataset-grid"></div>
-      <div class="center"><button id="loadMore" class="button secondary">Load more images</button></div>
+      <div class="section-heading"><div><p class="eyebrow">MODEL DATASETS</p><h2>Dataset explorer</h2><p>Browse read-only images and annotations, separated by model.</p></div></div>
+      <div class="dataset-tabs" role="tablist" aria-label="Dataset model">
+        <button type="button" class="dataset-tab active" role="tab" aria-selected="true" data-dataset-mode="detection">Container Detection</button>
+        <button type="button" class="dataset-tab" role="tab" aria-selected="false" data-dataset-mode="classification">Container Count Classification</button>
+      </div>
+      <div class="dataset-toolbar">
+        <label id="classifierDatasetPicker" hidden>Classifier dataset<select id="classifierDatasetSelect"></select></label>
+        <label>Search filename<input id="datasetSearch" type="search" placeholder="Filter by filename"></label>
+        <label>Filter<select id="datasetFilter"><option value="all">All images</option></select></label>
+      </div>
+      <div class="dataset-summary" id="datasetSummary" aria-live="polite"></div>
+      <div id="datasetGrid" class="dataset-grid" aria-live="polite"></div>
+      <div class="dataset-pagination"><button id="datasetPrevious" class="button secondary">Previous</button><span id="datasetPageStatus" class="muted small"></span><button id="datasetNext" class="button secondary">Next</button></div>
+      <dialog id="datasetImageDialog" class="dataset-dialog"><div class="dataset-dialog-head"><div><strong id="datasetDialogTitle"></strong><span id="datasetDialogLabel" class="muted small"></span></div><button id="datasetDialogClose" class="button ghost" type="button">Close</button></div><div id="datasetDialogImageBox" class="dataset-dialog-image"><img id="datasetDialogImage" alt="Selected dataset image"><canvas id="datasetDialogOverlay"></canvas></div><p id="datasetDialogAnnotation" class="muted small"></p><button id="useDatasetImage" class="button secondary" type="button">Use in Detect</button></dialog>
     </section>
 
     <section id="view-train" class="view" hidden>
+      <div class="card model-list-card"><div class="section-heading compact"><div><p class="eyebrow">SEPARATE CLASSIFICATION PIPELINE</p><h3>Train container count classifier</h3><p>Import the ZIP exported by Container-labeler. It includes crop images and labels.csv.</p></div></div><div class="export-form"><label>Dataset ZIP<input id="classifierZip" type="file" accept=".zip,application/zip"></label><button id="importClassifier" class="button secondary">Import dataset</button><span id="classifierImportStatus" class="muted small"></span><label>Architecture<select id="classifierArchitecture"><option value="mobilenet_v3_small">MobileNetV3 Small · recommended</option><option value="mobilenet_v3_large">MobileNetV3 Large</option></select></label><label>Epochs<input id="classifierEpochs" type="number" min="1" max="200" value="30"></label><label>Batch size<input id="classifierBatch" type="number" min="1" max="64" value="16"></label><label>Image size<input id="classifierSize" type="number" min="96" max="512" value="224"></label><label>Learning rate<input id="classifierLr" type="number" min="0.000001" max="0.1" step="0.0001" value="0.001"></label><label>Device<select id="classifierDevice"><option value="cpu">CPU</option><option value="cuda">GPU when available</option></select></label><button id="startClassifier" class="button primary">Start classifier training</button><button id="stopClassifier" class="button ghost" disabled>Stop</button></div><div id="classifierProgress" class="classifier-progress" aria-live="polite"><div class="progress-heading"><strong id="classifierStatus">No classifier selected</strong><span id="classifierEpoch">0 / 0 epochs</span></div><progress id="classifierProgressBar" max="1" value="0"></progress><p id="classifierProgressMessage" class="muted small">Classifier progress and validation metrics will appear here.</p><div id="classifierMetricRows" class="metric-rows"></div></div><div id="classifierRuns" class="model-list"></div></div>
       <div class="section-heading"><div><p class="eyebrow">CUSTOM MODEL TRAINING</p><h2>Train a container detector</h2><p>Starts from YOLO26n and learns the container boxes in the server dataset.</p></div><span class="pill amber">CPU training</span></div>
       <div class="train-layout">
         <form id="trainForm" class="card train-form">
@@ -69,6 +80,6 @@
     <footer><span>AI-VIsion-demo</span><span>Read-only dataset · isolated training runs</span></footer>
   </main>
   <div id="toast" role="status" class="toast" hidden></div>
-  <script src="/static/app.js?v=5"></script>
+  <script src="/static/app.js?v=9"></script>
 </body>
 </html>
