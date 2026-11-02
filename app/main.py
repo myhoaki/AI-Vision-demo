@@ -1145,6 +1145,18 @@ def classifier_worker(run_id: str) -> None:
         arch=job["architecture"]
         net = models.mobilenet_v3_small(weights=None) if arch == "mobilenet_v3_small" else models.mobilenet_v3_large(weights=None)
         net.classifier[-1] = nn.Linear(net.classifier[-1].in_features, 2)
+        checkpoint = job.get("initialCheckpoint")
+        if checkpoint:
+            source = next((row for row in classifier_runs() if row.get("id") == checkpoint.get("runId") and row.get("status") == "completed"), None)
+            checkpoint_path = source.get("bestPath" if checkpoint.get("kind") == "best" else "lastPath") if source else None
+            if not checkpoint_path or not Path(checkpoint_path).is_file():
+                raise ValueError("The selected classifier checkpoint is no longer available.")
+            payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            if not isinstance(payload, dict) or payload.get("architecture") != arch:
+                raise ValueError("The selected classifier checkpoint does not match this architecture.")
+            if payload.get("classes") != dataset.classes or not isinstance(payload.get("state_dict"), dict):
+                raise ValueError("The selected classifier checkpoint has incompatible classes or weights.")
+            net.load_state_dict(payload["state_dict"])
         device=torch.device("cuda" if job["device"]=="cuda" and torch.cuda.is_available() else "cpu"); net.to(device)
         criterion=nn.CrossEntropyLoss(); optimizer=torch.optim.AdamW(net.parameters(),lr=job["learningRate"])
         loader=lambda subset,shuffle: DataLoader(subset,batch_size=job["batchSize"],shuffle=shuffle,num_workers=0)
@@ -1271,8 +1283,21 @@ def start_classifier_training(request: dict[str,Any]):
         try: cfg=json.loads(meta.read_text()); epochs=max(1,min(200,int(request.get("epochs",30)))); batch=max(1,min(64,int(request.get("batchSize",16)))); size=max(96,min(512,int(request.get("imageSize",224)))); lr=float(request.get("learningRate",.001))
         except Exception as e: raise HTTPException(400,"Invalid training configuration") from e
         if not .000001<=lr<=.1: raise HTTPException(400,"Learning rate must be between 0.000001 and 0.1")
-        run_id=uuid.uuid4().hex; job={"id":run_id,"status":"queued","createdAt":utc_now(),"updatedAt":utc_now(),"datasetPath":cfg["path"],"datasetId":dataset_id,"datasetSize":cfg["imageCount"],"classCounts":cfg["classCounts"],"epochs":epochs,"batchSize":batch,"imageSize":size,"learningRate":lr,"architecture":request.get("architecture","mobilenet_v3_small"),"device":request.get("device","cpu"),"epoch":0}
-        if job["architecture"] not in {"mobilenet_v3_small","mobilenet_v3_large"}: raise HTTPException(400,"Unsupported architecture")
+        architecture=request.get("architecture","mobilenet_v3_small")
+        if not isinstance(architecture,str) or architecture not in {"mobilenet_v3_small","mobilenet_v3_large"}: raise HTTPException(400,"Unsupported architecture")
+        initial_checkpoint=None
+        checkpoint_run_id=request.get("checkpointRunId")
+        checkpoint_kind=request.get("checkpointKind","best")
+        if checkpoint_run_id:
+            if not re.fullmatch(r"[a-f0-9]{32}",str(checkpoint_run_id)) or not isinstance(checkpoint_kind,str) or checkpoint_kind not in {"best","last"}: raise HTTPException(400,"Choose a valid saved classifier checkpoint")
+            source=next((row for row in classifier_runs() if row.get("id")==checkpoint_run_id and row.get("status")=="completed"),None)
+            if not source: raise HTTPException(404,"Completed classifier run not found")
+            checkpoint_path=source.get("bestPath" if checkpoint_kind=="best" else "lastPath")
+            if not checkpoint_path or not Path(checkpoint_path).is_file(): raise HTTPException(404,"Classifier checkpoint not found")
+            if source.get("architecture")!=architecture: raise HTTPException(400,"Choose the same architecture as the selected checkpoint")
+            initial_checkpoint={"runId":checkpoint_run_id,"kind":checkpoint_kind}
+        run_id=uuid.uuid4().hex; job={"id":run_id,"status":"queued","createdAt":utc_now(),"updatedAt":utc_now(),"datasetPath":cfg["path"],"datasetId":dataset_id,"datasetSize":cfg["imageCount"],"classCounts":cfg["classCounts"],"epochs":epochs,"batchSize":batch,"imageSize":size,"learningRate":lr,"architecture":architecture,"device":request.get("device","cpu"),"epoch":0,"initialCheckpoint":initial_checkpoint}
+        if initial_checkpoint: job["checkpointSource"]={"runId":initial_checkpoint["runId"],"kind":initial_checkpoint["kind"]}
         save_classifier_job(job); _active_classifier=run_id; threading.Thread(target=classifier_worker,args=(run_id,),daemon=True).start(); return job
 
 
