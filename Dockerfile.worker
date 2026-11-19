@@ -1,0 +1,12 @@
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY requirements-worker.txt .
+RUN pip install --no-cache-dir -r requirements-worker.txt
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+COPY app ./app
+COPY worker ./worker
+ENV DATASET_ROOT=/dataset RUNS_DIR=/runs
+CMD ["python", "-m", "worker.main"]

@@ -1,0 +1,17 @@
+services:
+  training-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    stop_grace_period: 30m
+    environment:
+      DATASET_ROOT: /dataset
+      RUNS_DIR: /runs
+      LABELER_DB: /labeler-data/container-labeler.sqlite3
+      WORKER_HEARTBEAT_SECONDS: 10
+    volumes:
+      - ../container-labeler/data/server_dataset/container_images_verified:/dataset:ro
+      - ../container-labeler/data:/labeler-data:ro
+      - ./runs:/runs
+      - ./experiments/container-count-yolo-crops-0cb261aa-v1:/app/experiments/container-count-yolo-crops-0cb261aa-v1:ro

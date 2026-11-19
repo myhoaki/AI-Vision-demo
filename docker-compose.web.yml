@@ -1,0 +1,21 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${AI_VISION_PORT:-8768}:8768"
+    environment:
+      DATASET_ROOT: /dataset
+      RUNS_DIR: /runs
+      INFERENCE_MODEL_PATH: /inference/best.onnx
+      PORT: 8768
+      PADDLEOCR_DET_MODEL_DIR: ${PADDLEOCR_DET_MODEL_DIR:-}
+      PADDLEOCR_REC_MODEL_DIR: ${PADDLEOCR_REC_MODEL_DIR:-}
+    volumes:
+      - ../container-labeler/data/server_dataset/container_images_verified:/dataset:ro
+      - ../container-labeler/data:/labeler-data:ro
+      - ./runs:/runs
+      - ../Container-Inference:/inference:ro
+      - ./experiments/container-count-yolo-crops-0cb261aa-v1:/app/experiments/container-count-yolo-crops-0cb261aa-v1:ro

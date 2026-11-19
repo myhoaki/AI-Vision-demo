@@ -1,15 +1,4 @@
-services:
-  ai-vision-demo:
-    build: .
-    container_name: ai-vision-demo
-    restart: unless-stopped
-    ports:
-      - "${AI_VISION_PORT:-8768}:8768"
-    environment:
-      DATASET_ROOT: /dataset
-      RUNS_DIR: /runs
-      PORT: 8768
-    volumes:
-      - ../container-labeler/data/server_dataset/container_images_verified:/dataset:ro
-      - ../container-labeler/data:/labeler-data:ro
-      - ./runs:/runs
+# Backward-compatible alias for the web-only deployment. Training runs in the
+# separate docker-compose.training.yml project and is never included here.
+include:
+  - path: docker-compose.web.yml

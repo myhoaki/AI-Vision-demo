@@ -9,6 +9,7 @@ RUN apt-get update \
 COPY requirements-export.txt .
 RUN pip install --no-cache-dir -r requirements-export.txt
 COPY app ./app
+COPY sliding_inference_final.py ./sliding_inference_final.py
 ENV DATASET_ROOT=/dataset RUNS_DIR=/runs PORT=8768
 EXPOSE 8768
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8768}"]
