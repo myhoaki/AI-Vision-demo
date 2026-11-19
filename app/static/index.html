@@ -4,19 +4,20 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#101914">
   <title>AI-VIsion-demo · Container detection</title>
-  <link rel="stylesheet" href="/static/style.css?v=15">
+  <link rel="stylesheet" href="/static/style.css?v=16">
 </head>
 <body>
+  <a href="#main-content" class="skip-link visually-hidden">Skip to main content</a>
   <header class="shell topbar">
     <a class="brand" href="#detect" aria-label="AI Vision Demo home"><span class="brand-mark">AI</span><span><strong>AI-VIsion-demo</strong><small>Container intelligence workspace</small></span></a>
     <div class="top-meta"><span class="live-dot"></span><span id="serviceStatus">Connecting to local server</span></div>
   </header>
-  <main class="shell">
+  <main id="main-content" class="shell">
     <section class="hero">
       <div><p class="eyebrow">COMPUTER VISION · YOLO26</p><h1>See every container clearly.</h1><p class="hero-copy">Inspect the labeled dataset, train a container detector, then run it on your own images.</p></div>
       <div class="hero-stat"><strong id="heroImageCount">—</strong><span>server images<br>available for training</span></div>
     </section>
-    <nav class="tabs" aria-label="Workspace sections"><button class="tab" data-view="detect">Detect</button><button class="tab" data-view="inference">Inference</button><button class="tab" data-view="dataset">Dataset</button><button class="tab" data-view="train">Train model</button></nav>
+    <nav class="tabs" aria-label="Workspace sections"><button type="button" class="tab active" data-view="detect" aria-current="page">Detect</button><button type="button" class="tab" data-view="inference">Inference</button><button type="button" class="tab" data-view="dataset">Dataset</button><button type="button" class="tab" data-view="train">Train model</button></nav>
 
     <section id="view-detect" class="view active">
       <div class="section-heading"><div><p class="eyebrow">CONTAINER DETECTOR</p><h2>Run an image</h2><p>Upload a photo or select one from the server dataset. Inference runs on the server CPU.</p></div><span class="pill" id="modelPill">Checking trained models</span></div>
@@ -55,9 +56,9 @@
     <section id="view-dataset" class="view" hidden>
       <div class="section-heading"><div><p class="eyebrow">MODEL DATASETS</p><h2>Dataset explorer</h2><p>Browse read-only images and annotations, separated by model.</p></div></div>
       <div class="card dataset-catalog-card"><div class="section-heading compact"><div><p class="eyebrow">SHARED SOURCE DATASET</p><h3>Dataset management</h3><p>Original images are counted once; derived samples and each model's splits are shown separately.</p></div><button id="refreshDatasetCatalog" class="button ghost" type="button">Refresh statistics</button></div><div id="datasetCatalogStats" class="catalog-stats" aria-live="polite"><p class="muted small">Loading shared dataset statistics…</p></div></div>
-      <div class="dataset-tabs" role="tablist" aria-label="Dataset model">
-        <button type="button" class="dataset-tab active" role="tab" aria-selected="true" data-dataset-mode="detection">Container Detection</button>
-        <button type="button" class="dataset-tab" role="tab" aria-selected="false" data-dataset-mode="classification">Container Count Classification</button>
+      <div class="dataset-tabs" role="tablist" focusgroup="tablist nomemory" aria-label="Dataset model">
+        <button type="button" id="dataset-tab-detection" class="dataset-tab active" role="tab" aria-selected="true" focusgroupstart data-dataset-mode="detection">Container Detection</button>
+        <button type="button" id="dataset-tab-classification" class="dataset-tab" role="tab" aria-selected="false" data-dataset-mode="classification">Container Count Classification</button>
       </div>
       <div class="dataset-toolbar">
         <label>Search filename<input id="datasetSearch" type="search" placeholder="Filter by filename"></label>
@@ -66,20 +67,51 @@
       </div>
       <div class="dataset-summary" id="datasetSummary" aria-live="polite"></div>
       <div id="datasetGrid" class="dataset-grid" aria-live="polite"></div>
-      <div class="dataset-pagination"><button id="datasetPrevious" class="button secondary">Previous</button><span id="datasetPageStatus" class="muted small"></span><button id="datasetNext" class="button secondary">Next</button></div>
-      <dialog id="datasetImageDialog" class="dataset-dialog"><div class="dataset-dialog-head"><div><strong id="datasetDialogTitle"></strong><span id="datasetDialogLabel" class="muted small"></span></div><button id="datasetDialogClose" class="button ghost" type="button">Close</button></div><div id="datasetDialogImageBox" class="dataset-dialog-image"><img id="datasetDialogImage" alt="Selected dataset image"><canvas id="datasetDialogOverlay"></canvas></div><p id="datasetDialogAnnotation" class="muted small"></p><button id="useDatasetImage" class="button secondary" type="button">Use in Detect</button></dialog>
+      <div class="dataset-pagination"><button id="datasetPrevious" type="button" class="button secondary">Previous</button><span id="datasetPageStatus" class="muted small"></span><button id="datasetNext" type="button" class="button secondary">Next</button></div>
+      <dialog id="datasetImageDialog" class="dataset-dialog" closedby="any" aria-labelledby="datasetDialogTitle"><div class="dataset-dialog-head"><div><strong id="datasetDialogTitle"></strong><span id="datasetDialogLabel" class="muted small"></span></div><button id="datasetDialogClose" class="button ghost" type="button">Close</button></div><div id="datasetDialogImageBox" class="dataset-dialog-image"><img id="datasetDialogImage" alt="Selected dataset image"><canvas id="datasetDialogOverlay"></canvas></div><p id="datasetDialogAnnotation" class="muted small"></p><button id="useDatasetImage" class="button secondary" type="button">Use in Detect</button></dialog>
     </section>
 
     <section id="view-train" class="view" hidden>
       <div class="section-heading training-models-heading"><div><p class="eyebrow">MODEL WORKSPACE</p><h2>Training Models</h2><p>Independent pipelines for container detection, casting-hole detection, and container counting.</p></div></div>
-      <div class="checkpoint-filters train-subtabs" role="tablist" aria-label="Training pipelines" style="margin-bottom:16px"><button type="button" class="filter-button active" data-train-tab="detector" aria-selected="true">Container Detector</button><button type="button" class="filter-button" data-train-tab="casting_holes" aria-selected="false">Casting Holes Detection</button><button type="button" class="filter-button" data-train-tab="classifier" aria-selected="false">Container Count Classifier</button></div>
-      <section class="classifier-model-section" aria-labelledby="classifierModelTitle" hidden>
-      <div class="card model-list-card classifier-model-card"><div class="section-heading compact"><div><p class="eyebrow">SEPARATE CLASSIFICATION PIPELINE</p><h3 id="classifierModelTitle">Container Count Classifier <span class="model-architecture">MobileNetV3</span></h3><p>Classifies an image as containing 1 container or 2 containers. Train from image-level container counts already verified in Container-labeler or import a labeled dataset.</p></div></div><div class="export-form"><label>Dataset source<select id="classifierDatasetSource"><option value="server">Server dataset · full truck images</option><option value="yolo_crops">Production-matched YOLO union crops · syncs verified labels</option><option value="imported">Imported labeled ZIP dataset</option></select></label><div id="classifierImportControls" class="classifier-import-controls" hidden><label>Dataset ZIP<input id="classifierZip" type="file" accept=".zip,application/zip"></label><button id="importClassifier" class="button secondary">Import dataset</button><span id="classifierImportStatus" class="muted small"></span></div><p id="classifierDatasetHelp" class="classifier-checkpoint-help">Server training uses Container-labeler count labels linked to each original full truck image; detector box counts are not used.</p><label>Start from<select id="classifierStartMode"><option value="scratch">Train from scratch</option><option value="checkpoint">Start from a saved checkpoint</option></select></label><label id="classifierCheckpointRow" hidden>Classifier checkpoint<select id="classifierCheckpointSelect" disabled><option value="">No completed classifier checkpoints</option></select></label><p id="classifierCheckpointHelp" class="classifier-checkpoint-help" hidden>Starts a new run using the selected weights; the source run remains unchanged.</p><label>Architecture<select id="classifierArchitecture"><option value="mobilenet_v3_small">MobileNetV3 Small · recommended</option><option value="mobilenet_v3_large">MobileNetV3 Large</option></select></label><label>Epochs<input id="classifierEpochs" type="number" min="1" max="200" value="30"></label><label>Batch size<input id="classifierBatch" type="number" min="1" max="64" value="16"></label><label>Image size<input id="classifierSize" type="number" min="96" max="512" value="224"></label><label>Learning rate<input id="classifierLr" type="number" min="0.000001" max="0.1" step="0.0001" value="0.001"></label><label>Device<select id="classifierDevice"><option value="cpu">CPU</option><option value="cuda">GPU when available</option></select></label><fieldset class="class-balancing"><legend>Class Balancing</legend><div id="classifierDatasetSummary" class="classifier-dataset-summary muted small">Loading class distribution…</div><label>Strategy<select id="classifierBalancingStrategy"><option value="none">None · ordinary random sampling</option><option value="weighted_sampling">Weighted Random Sampling</option><option value="class_weighted_loss">Class-weighted loss</option></select></label><label>Target distribution<select id="classifierTargetDistribution"><option value="70:30">70:30 · recommended</option><option value="60:40">60:40</option><option value="50:50">50:50</option></select></label><p class="muted small">Balancing affects training only. Validation and test retain the original distribution.</p></fieldset><button id="startClassifier" class="button primary">Start classifier training</button><button id="stopClassifier" class="button ghost" disabled>Stop</button></div><div id="classifierProgress" class="classifier-progress" aria-live="polite"><div class="progress-heading"><strong id="classifierStatus">No classifier selected</strong><span id="classifierEpoch">0 / 0 epochs</span></div><progress id="classifierProgressBar" max="1" value="0"></progress><p id="classifierProgressMessage" class="muted small">Classifier progress and validation metrics will appear here.</p></div><div id="classifierRuns" class="model-list classifier-runs"></div></div></section>
-      <section class="detector-model-section" aria-labelledby="detectorModelTitle"><div class="section-heading detector-heading"><div><p class="eyebrow">CONTAINER DETECTOR · YOLO26n</p><h2 id="detectorModelTitle">Container Detector</h2><p>Detects containers and draws bounding boxes around them.</p></div><span class="pill amber">CPU training</span></div>
+      <div class="checkpoint-filters train-subtabs" role="tablist" focusgroup="tablist nomemory" aria-label="Training pipelines"><button type="button" id="train-tab-detector" role="tab" class="filter-button active" data-train-tab="detector" aria-selected="true" focusgroupstart>Container Detector</button><button type="button" id="train-tab-casting" role="tab" class="filter-button" data-train-tab="casting_holes" aria-selected="false">Casting Holes Detection</button><button type="button" id="train-tab-classifier" role="tab" class="filter-button" data-train-tab="classifier" aria-selected="false">Container Count Classifier</button></div>
+      <section class="classifier-model-section" role="tabpanel" aria-labelledby="train-tab-classifier" hidden>
+        <div class="section-heading detector-heading"><div><p class="eyebrow">SEPARATE CLASSIFICATION PIPELINE</p><h3 id="classifierModelTitle">Container Count Classifier <span class="model-architecture">MobileNetV3</span></h3><p>Classifies an image as containing 1 container or 2 containers using verified Container-Labeler counts or an imported dataset.</p></div></div>
+        <div class="train-layout">
+          <div class="card train-form classifier-form-card">
+            <div class="form-head"><div class="step-number">01</div><div><h3>Classifier setup</h3><p>Configure dataset source, architecture, and class balancing.</p></div></div>
+            <label>Dataset source<select id="classifierDatasetSource"><option value="server">Server dataset · full truck images</option><option value="yolo_crops">Production-matched YOLO union crops · syncs verified labels</option><option value="imported">Imported labeled ZIP dataset</option></select></label>
+            <div id="classifierImportControls" class="classifier-import-controls" hidden><label>Dataset ZIP<input id="classifierZip" type="file" accept=".zip,application/zip"></label><button id="importClassifier" type="button" class="button secondary">Import dataset</button><span id="classifierImportStatus" class="muted small"></span></div>
+            <p id="classifierDatasetHelp" class="classifier-checkpoint-help">Server training uses Container-labeler count labels linked to each original full truck image; detector box counts are not used.</p>
+            <div class="form-grid form-grid-2">
+              <label>Start from<select id="classifierStartMode"><option value="scratch">Train from scratch</option><option value="checkpoint">Start from a saved checkpoint</option></select></label>
+              <label>Architecture<select id="classifierArchitecture"><option value="mobilenet_v3_small">MobileNetV3 Small · recommended</option><option value="mobilenet_v3_large">MobileNetV3 Large</option></select></label>
+            </div>
+            <label id="classifierCheckpointRow" hidden>Classifier checkpoint<select id="classifierCheckpointSelect" disabled><option value="">No completed classifier checkpoints</option></select></label>
+            <p id="classifierCheckpointHelp" class="classifier-checkpoint-help" hidden>Starts a new run using the selected weights; the source run remains unchanged.</p>
+            <div class="form-grid">
+              <label>Epochs<input id="classifierEpochs" type="number" min="1" max="200" value="30"></label>
+              <label>Batch size<input id="classifierBatch" type="number" min="1" max="64" value="16"></label>
+              <label>Image size<input id="classifierSize" type="number" min="96" max="512" value="224"></label>
+            </div>
+            <div class="form-grid form-grid-2">
+              <label>Learning rate<input id="classifierLr" type="number" min="0.000001" max="0.1" step="0.0001" value="0.001"></label>
+              <label>Device<select id="classifierDevice"><option value="cpu">CPU</option><option value="cuda">GPU when available</option></select></label>
+            </div>
+            <fieldset class="class-balancing"><legend>Class Balancing</legend><div id="classifierDatasetSummary" class="classifier-dataset-summary muted small">Loading class distribution…</div><label>Strategy<select id="classifierBalancingStrategy"><option value="none">None · ordinary random sampling</option><option value="weighted_sampling">Weighted Random Sampling</option><option value="class_weighted_loss">Class-weighted loss</option></select></label><label>Target distribution<select id="classifierTargetDistribution"><option value="70:30">70:30 · recommended</option><option value="60:40">60:40</option><option value="50:50">50:50</option></select></label><p class="muted small">Balancing affects training only. Validation and test retain the original distribution.</p></fieldset>
+            <div class="form-actions-row"><button id="startClassifier" type="button" class="button primary wide">Start classifier training</button><button id="stopClassifier" type="button" class="button ghost wide" disabled>Stop</button></div>
+          </div>
+          <div class="card progress-card">
+            <div class="form-head"><div class="step-number muted-step">02</div><div><h3>Classifier progress &amp; runs</h3><p>Live epoch progress and saved MobileNetV3 checkpoints.</p></div></div>
+            <div id="classifierProgress" class="classifier-progress" aria-live="polite"><div class="progress-heading"><strong id="classifierStatus">No classifier selected</strong><span id="classifierEpoch">0 / 0 epochs</span></div><progress id="classifierProgressBar" max="1" value="0"></progress><p id="classifierProgressMessage" class="muted small">Classifier progress and validation metrics will appear here.</p></div>
+            <div id="classifierRuns" class="model-list classifier-runs"></div>
+          </div>
+        </div>
+      </section>
+      <section class="detector-model-section" role="tabpanel" aria-labelledby="train-tab-detector"><div class="section-heading detector-heading"><div><p class="eyebrow">CONTAINER DETECTOR · YOLO26n</p><h2 id="detectorModelTitle">Container Detector</h2><p>Detects containers and draws bounding boxes around them.</p></div><span class="pill amber">CPU training</span></div>
       <div class="train-layout">
         <form id="trainForm" class="card train-form">
           <div class="form-head"><div class="step-number">01</div><div><h3>Training setup</h3><p>Training creates a separate run under this project.</p></div></div>
-          <label>Dataset<select id="datasetSource"><option value="container_detector">Container detection · server dataset</option><option value="casting_holes">Casting holes · labeler crops</option></select></label>
+          <label id="datasetSourceRow" hidden>Dataset<select id="datasetSource"><option value="container_detector">Container detection · server dataset</option><option value="casting_holes">Casting holes · labeler crops</option></select></label>
           <label>Training mode<select id="initMode"><option value="base">New model · start from YOLO26 weights</option><option value="finetune">Fine-tune · start a new run from .pt weights</option><option value="resume">Resume · continue an interrupted run from last.pt</option></select></label>
           <label id="baseModelRow">Base checkpoint<select id="baseModel"><option value="yolo26n.pt">YOLO26n · fastest, recommended</option><option value="yolo26s.pt">YOLO26s · balanced</option><option value="yolo26m.pt">YOLO26m · higher capacity</option></select></label>
           <label id="checkpointRow" hidden>Saved checkpoint<select id="checkpointSelect"></select></label>
@@ -102,6 +134,6 @@
     <footer><span>AI-VIsion-demo</span><span>Read-only dataset · isolated training runs</span></footer>
   </main>
   <div id="toast" role="status" class="toast" hidden></div>
-  <script src="/static/app.js?v=20261109-inference-stop"></script>
+  <script src="/static/app.js?v=20261119-ux"></script>
 </body>
 </html>
