@@ -292,7 +292,9 @@ def checkpoint_models() -> list[dict[str, Any]]:
                 continue
             best = checkpoint_weight_dir(metadata, job) / "best.pt"
             if best.is_file() and job.get("status") == "completed":
-                models.append({"id": job["id"], "name": f"Container {Path(job.get('baseModel', 'yolo26n.pt')).stem.upper()} · {job['id'][:8]}", "path": str(best), "createdAt": job.get("updatedAt"), "epochs": job.get("epochs"), "metrics": job.get("metrics", {})})
+                source = job.get("datasetSource") or (job.get("request") or {}).get("datasetSource") or "container_detector"
+                label = "Casting holes" if source == "casting_holes" else "Container"
+                models.append({"id": job["id"], "datasetSource": source, "name": f"{label} {Path(job.get('baseModel', 'yolo26n.pt')).stem.upper()} · {job['id'][:8]}", "path": str(best), "createdAt": job.get("updatedAt"), "epochs": job.get("epochs"), "metrics": job.get("metrics", {})})
         except (OSError, ValueError, KeyError):
             continue
     return sorted(models, key=lambda model: model.get("createdAt") or "", reverse=True)
@@ -596,12 +598,12 @@ def save_export(job: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def selected_model(model_id: str | None = None) -> tuple[str, Any]:
+def selected_model(model_id: str | None = None, dataset_source: str = "container_detector") -> tuple[str, Any]:
     global _loaded_model
-    models = checkpoint_models()
+    models = [m for m in checkpoint_models() if m.get("datasetSource", "container_detector") == dataset_source]
     match = next((model for model in models if model["id"] == model_id), None) if model_id else (models[0] if models else None)
     if not match:
-        raise HTTPException(409 if not models else 404, "Train a container detector before running inference" if not models else "Trained model not found")
+        raise HTTPException(409 if not models else 404, ("Train a casting-hole detector before running inference" if dataset_source == "casting_holes" else "Train a container detector before running inference") if not models else "Trained model not found")
     path = match["path"]
     with _model_lock:
         if _loaded_model and _loaded_model[0] == path:
@@ -2631,11 +2633,16 @@ async def run_onnx_inference(file: UploadFile = File(...), confidence: float = 0
 
 
 @app.post("/api/detect")
-async def detect(file: UploadFile = File(...), modelId: str | None = None, classifierId: str | None = None, confidence: float = 0.25, ocrEnabled: bool = False, ocrWholeImage: bool = False, ocrLanguage: str = "en", ocrModel: str = "PP-OCRv4", ocrConfidence: float = 0.25, ocrMode: str = "roi", roiPositions: str = "0,50,100", roiWidth: float = 15, roiHeight: float = 75, roiPadding: float = 2, cropPadding: float = 0.04, ocrRotations: str = "0,90,180,270", ocrMaxAttempts: int = 8, ocrFullFallback: bool = True, ocrContrast: bool = False, ocrGrayscale: bool = False, ocrSharpen: bool = False, ocrUpscale: float = 1, ocrGroundTruth: str = ""):
+async def detect(file: UploadFile = File(...), modelId: str | None = None, classifierId: str | None = None, castingModelId: str | None = None, confidence: float = 0.25, ocrEnabled: bool = False, ocrWholeImage: bool = False, ocrLanguage: str = "en", ocrModel: str = "PP-OCRv4", ocrConfidence: float = 0.25, ocrMode: str = "roi", roiPositions: str = "0,50,100", roiWidth: float = 15, roiHeight: float = 75, roiPadding: float = 2, cropPadding: float = 0.04, ocrRotations: str = "0,90,180,270", ocrMaxAttempts: int = 8, ocrFullFallback: bool = True, ocrContrast: bool = False, ocrGrayscale: bool = False, ocrSharpen: bool = False, ocrUpscale: float = 1, ocrGroundTruth: str = ""):
     inference_started = time.perf_counter()
     suffix = Path(file.filename or "image.jpg").suffix.lower()
     if suffix not in SUPPORTED:
         raise HTTPException(400, "Upload a JPG, PNG, WebP, BMP or TIFF image")
+    skip_container = modelId == "none"
+    if skip_container:
+        classifierId = None
+        ocrEnabled = False
+        modelId = None
     if not 0.01 <= confidence <= 0.99:
         raise HTTPException(400, "Confidence must be between 0.01 and 0.99")
     if not 0.01 <= ocrConfidence <= 0.99:
@@ -2671,20 +2678,27 @@ async def detect(file: UploadFile = File(...), modelId: str | None = None, class
         inference_contents = normalized_buffer.getvalue()
     except Exception as error:
         raise HTTPException(400, "Uploaded file is not a readable image") from error
-    checkpoint, model = selected_model(modelId)
-    with tempfile.NamedTemporaryFile(suffix=".png") as temporary:
-        temporary.write(inference_contents)
-        temporary.flush()
-        try:
-            results = model.predict(source=temporary.name, conf=confidence, device="cpu", verbose=False)
-        except Exception as error:
-            raise HTTPException(500, f"Detection failed: {str(error)[:500]}") from error
-    boxes = []
-    if results[0].boxes is not None:
-        for box in results[0].boxes:
-            x1, y1, x2, y2 = [float(value) for value in box.xyxy[0].tolist()]
-            boxes.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "confidence": float(box.conf[0]), "className": "container"})
-    response = {"width": width, "height": height, "boxes": boxes, "model": Path(checkpoint).name, "count": len(boxes), "containerDetected": bool(boxes)}
+    def run_detector(dataset_source: str, model_id: str | None, class_name: str):
+        path, detector = selected_model(model_id, dataset_source)
+        with tempfile.NamedTemporaryFile(suffix=".png") as temporary:
+            temporary.write(inference_contents)
+            temporary.flush()
+            try:
+                results = detector.predict(source=temporary.name, conf=confidence, device="cpu", verbose=False)
+            except Exception as error:
+                raise HTTPException(500, f"Detection failed: {str(error)[:500]}") from error
+        found = []
+        if results[0].boxes is not None:
+            for box in results[0].boxes:
+                x1, y1, x2, y2 = [float(value) for value in box.xyxy[0].tolist()]
+                found.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "confidence": float(box.conf[0]), "className": class_name})
+        return path, found
+
+    checkpoint, boxes = (None, []) if skip_container else run_detector("container_detector", modelId, "container")
+    response = {"width": width, "height": height, "boxes": boxes, "model": Path(checkpoint).name if checkpoint else None, "count": len(boxes), "containerDetected": bool(boxes), "containerSkipped": skip_container}
+    if castingModelId:
+        casting_path, casting_boxes = run_detector("casting_holes", None if castingModelId == "latest" else castingModelId, "casting_hole")
+        response["castingHoles"] = {"boxes": casting_boxes, "count": len(casting_boxes), "model": Path(casting_path).name, "detected": bool(casting_boxes)}
     # OCR is opt-in per request and runs after the existing detector. Keep failures
     # local to the OCR result so detector and classifier output remain usable.
     if classifierId:
